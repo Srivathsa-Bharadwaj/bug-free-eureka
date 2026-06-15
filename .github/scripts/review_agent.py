@@ -42,9 +42,9 @@ def run_ruff(files):
         return result.stdout[:500] or "Ruff: no output."
 
 def ask_gemini(diff, ruff_output):
-    from google import genai
-
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-2.0-flash")
 
     prompt = f"""You are an expert code reviewer. Review the following PR diff and static analysis output.
 
@@ -71,10 +71,7 @@ Up to 3 concrete improvement suggestions.
 
 Keep the review concise and actionable. If no issues, say so clearly."""
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=prompt
-    )
+    response = model.generate_content(prompt)
     return response.text
 
 def post_comment(body):
