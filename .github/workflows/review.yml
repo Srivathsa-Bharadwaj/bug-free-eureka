@@ -24,7 +24,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests google-generativeai ruff bandit
+          pip install requests google-genai ruff bandit
 
       - name: Run AI review
         env:
