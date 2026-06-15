@@ -1,9 +1,11 @@
 import os, json, requests, subprocess, time
 
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 PR_NUMBER = os.environ["PR_NUMBER"]
 REPO = os.environ["REPO"]
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+MODEL = "qwen2.5-coder:1.5b"
 
 GH_HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -24,8 +26,8 @@ def get_diff_text(files):
     for f in files:
         if f.get("patch"):
             chunks.append(f"File: {f['filename']}\n{f['patch']}")
-    full = "\n\n---\n\n".join(chunks[:5])  # cap at 5 files
-    return full[:8000]                     # hard cap at 8000 chars
+    full = "\n\n---\n\n".join(chunks[:5])
+    return full[:6000]
 
 
 def run_ruff(files):
@@ -49,74 +51,116 @@ def run_ruff(files):
         return result.stdout[:500] or "Ruff: no output."
 
 
-def ask_gemini(diff, ruff_output):
-    from google import genai
+def run_bandit(files):
+    py_files = [f["filename"] for f in files if f["filename"].endswith(".py")]
+    if not py_files:
+        return "No Python files for security scan."
+    result = subprocess.run(
+        ["bandit", "-r", "-f", "json"] + py_files,
+        capture_output=True, text=True
+    )
+    try:
+        data = json.loads(result.stdout)
+        issues = data.get("results", [])
+        if not issues:
+            return "Bandit: no security issues found."
+        lines = [
+            f"- {i['filename']}:{i['line_number']} [{i['issue_severity']}] {i['issue_text']}"
+            for i in issues[:15]
+        ]
+        return "Bandit security findings:\n" + "\n".join(lines)
+    except Exception:
+        return result.stdout[:500] or "Bandit: no output."
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
 
-    prompt = f"""You are an expert code reviewer. Review the following PR diff and static analysis output.
+def wait_for_ollama(retries=10, delay=3):
+    for i in range(retries):
+        try:
+            resp = requests.get("http://localhost:11434/api/tags", timeout=3)
+            if resp.status_code == 200:
+                print("Ollama is ready.")
+                return
+        except Exception:
+            pass
+        print(f"Waiting for Ollama... ({i+1}/{retries})")
+        time.sleep(delay)
+    raise RuntimeError("Ollama did not start in time.")
+
+
+def ask_ollama(diff, ruff_output, bandit_output):
+    prompt = f"""You are an expert code reviewer. Review the following PR diff and static analysis results.
 
 Focus on:
-1. Security issues (hardcoded secrets, injection risks, missing auth)
-2. Performance problems (N+1 queries, unnecessary loops, blocking calls)
-3. Code quality (unclear naming, missing error handling, no docstrings)
+1. Security issues (hardcoded secrets, injection risks, missing auth checks)
+2. Performance problems (N+1 queries, unnecessary loops, blocking I/O)
+3. Code quality (unclear naming, missing error handling, missing docstrings)
 
-Static analysis output:
+Static analysis (Ruff):
 {ruff_output}
+
+Security scan (Bandit):
+{bandit_output}
 
 PR diff:
 {diff}
 
-Respond in this format:
+Respond using this exact format:
+
 ## Summary
-One paragraph overview of the PR changes.
+One paragraph overview of the changes in this PR.
 
 ## Issues found
-For each issue: severity (🔴 High / 🟡 Medium / 🟢 Low), file + line if known, and a clear explanation.
+For each issue use: severity (🔴 High / 🟡 Medium / 🟢 Low), filename and line if known, clear explanation.
 
 ## Suggestions
-Up to 3 concrete improvement suggestions.
+Up to 3 concrete, actionable improvement suggestions.
 
-Keep the review concise and actionable. If no issues, say so clearly."""
+Be concise. If no issues are found, say so clearly."""
 
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model="gemini-1.5-flash",
-                contents=prompt
-            )
-            return response.text
-        except Exception as e:
-            if "429" in str(e) and attempt < 2:
-                wait = 60 * (attempt + 1)  # 60s on first retry, 120s on second
-                print(f"Rate limited. Waiting {wait}s before retry {attempt + 2}/3...")
-                time.sleep(wait)
-            else:
-                raise
+    payload = {
+        "model": MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.2,
+            "num_predict": 1024
+        }
+    }
+
+    resp = requests.post(OLLAMA_URL, json=payload, timeout=180)
+    resp.raise_for_status()
+    return resp.json()["response"]
 
 
 def post_comment(body):
     url = f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments"
-    payload = {"body": f"## 🤖 AI Code Review\n\n{body}"}
+    payload = {"body": f"## 🤖 AI Code Review\n\n{body}\n\n---\n*Reviewed by qwen2.5-coder running locally on GitHub Actions*"}
     resp = requests.post(url, headers=GH_HEADERS, json=payload)
     resp.raise_for_status()
     print(f"Comment posted: {resp.json()['html_url']}")
 
 
 if __name__ == "__main__":
+    print("Waiting for Ollama to be ready...")
+    wait_for_ollama()
+
     print("Fetching PR files...")
     files = get_pr_files()
 
-    print("Running ruff...")
+    print("Running Ruff...")
     ruff_output = run_ruff(files)
+    print(ruff_output)
+
+    print("Running Bandit...")
+    bandit_output = run_bandit(files)
+    print(bandit_output)
 
     print("Building diff...")
     diff = get_diff_text(files)
 
-    print("Calling Gemini...")
-    review = ask_gemini(diff, ruff_output)
+    print("Calling local LLM via Ollama...")
+    review = ask_ollama(diff, ruff_output, bandit_output)
 
-    print("Posting comment...")
+    print("Posting comment to PR...")
     post_comment(review)
     print("Done.")
-    
