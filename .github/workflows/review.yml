@@ -23,7 +23,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python dependencies
-        run: pip install requests ruff bandit
+        run: pip install requests ruff bandit radon pytest pytest-cov
 
       - name: Install Ollama
         run: curl -fsSL https://ollama.com/install.sh | sh

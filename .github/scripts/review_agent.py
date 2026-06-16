@@ -87,19 +87,26 @@ def wait_for_ollama(retries=10, delay=3):
     raise RuntimeError("Ollama did not start in time.")
 
 
-def ask_ollama(diff, ruff_output, bandit_output):
+def ask_ollama(diff, ruff_output, bandit_output, radon_output, pytest_output):
     prompt = f"""You are an expert code reviewer. Review the following PR diff and static analysis results.
 
 Focus on:
 1. Security issues (hardcoded secrets, injection risks, missing auth checks)
 2. Performance problems (N+1 queries, unnecessary loops, blocking I/O)
 3. Code quality (unclear naming, missing error handling, missing docstrings)
+4. Test coverage gaps (functions changed but not tested)
 
 Static analysis (Ruff):
 {ruff_output}
 
 Security scan (Bandit):
 {bandit_output}
+
+Complexity analysis (Radon):
+{radon_output}
+
+Test status (Pytest):
+{pytest_output}
 
 PR diff:
 {diff}
@@ -139,8 +146,28 @@ def post_comment(body):
     resp.raise_for_status()
     print(f"Comment posted: {resp.json()['html_url']}")
 
+def run_radon(files):
+    py_files = [f["filename"] for f in files if f["filename"].endswith(".py")]
+    if not py_files:
+        return "No Python files for complexity analysis."
+    result = subprocess.run(
+        ["radon", "cc", "--min", "B", "--show-complexity", "-s"] + py_files,
+        capture_output=True, text=True
+    )
+    return result.stdout[:1000] or "Radon: no complex functions found."
 
-if __name__ == "__main__":
+
+def run_pytest():
+    result = subprocess.run(
+        ["pytest", "--tb=no", "-q", "--co"],  # just collect, don't run (fast)
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return "No tests found or pytest not configured."
+    test_count = result.stdout.count("test session starts")
+    return f"Pytest: {result.stdout[:500]}"
+
+"""if __name__ == "__main__":
     print("Waiting for Ollama to be ready...")
     wait_for_ollama()
 
@@ -158,8 +185,44 @@ if __name__ == "__main__":
     print("Building diff...")
     diff = get_diff_text(files)
 
+    radon_output = run_radon(files)
+
     print("Calling local LLM via Ollama...")
-    review = ask_ollama(diff, ruff_output, bandit_output)
+    #review = ask_ollama(diff, ruff_output, bandit_output)
+    review = ask_ollama(diff, ruff_output, bandit_output, radon_output)
+
+    print("Posting comment to PR...")
+    post_comment(review)
+    print("Done.")"""
+
+if __name__ == "__main__":
+    print("Waiting for Ollama to be ready...")
+    wait_for_ollama()
+
+    print("Fetching PR files...")
+    files = get_pr_files()
+
+    print("Running Ruff...")
+    ruff_output = run_ruff(files)
+    print(ruff_output)
+
+    print("Running Bandit...")
+    bandit_output = run_bandit(files)
+    print(bandit_output)
+
+    print("Running Radon...")
+    radon_output = run_radon(files)
+    print(radon_output)
+
+    print("Running Pytest...")
+    pytest_output = run_pytest()
+    print(pytest_output)
+
+    print("Building diff...")
+    diff = get_diff_text(files)
+
+    print("Calling local LLM via Ollama...")
+    review = ask_ollama(diff, ruff_output, bandit_output, radon_output, pytest_output)
 
     print("Posting comment to PR...")
     post_comment(review)
