@@ -1,4 +1,4 @@
-import os, json, requests, subprocess, time
+import os, json, requests, subprocess, time, base64
 from collections import defaultdict
 
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
@@ -55,11 +55,27 @@ def group_files_by_language(files):
 
 # ── GitHub helpers ─────────────────────────────────────────────────────────────
 
+def get_pr_info():
+    url = f"https://api.github.com/repos/{REPO}/pulls/{PR_NUMBER}"
+    resp = requests.get(url, headers=GH_HEADERS)
+    resp.raise_for_status()
+    return resp.json()
+
 def get_pr_files():
     url = f"https://api.github.com/repos/{REPO}/pulls/{PR_NUMBER}/files"
     resp = requests.get(url, headers=GH_HEADERS)
     resp.raise_for_status()
     return resp.json()
+
+def get_file_content(filepath, ref):
+    """Fetch raw file content from GitHub at a specific ref."""
+    url = f"https://api.github.com/repos/{REPO}/contents/{filepath}?ref={ref}"
+    resp = requests.get(url, headers=GH_HEADERS)
+    if resp.status_code == 404:
+        return None  # file deleted in this PR
+    resp.raise_for_status()
+    data = resp.json()
+    return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
 
 def get_diff_text(files):
     chunks = []
@@ -69,6 +85,77 @@ def get_diff_text(files):
             chunks.append(f"File: {f['filename']} (language: {lang})\n{f['patch']}")
     full = "\n\n---\n\n".join(chunks[:8])
     return full[:8000]
+
+def get_default_branch():
+    url = f"https://api.github.com/repos/{REPO}"
+    resp = requests.get(url, headers=GH_HEADERS)
+    resp.raise_for_status()
+    return resp.json()["default_branch"]
+
+def get_branch_sha(branch):
+    url = f"https://api.github.com/repos/{REPO}/git/ref/heads/{branch}"
+    resp = requests.get(url, headers=GH_HEADERS)
+    resp.raise_for_status()
+    return resp.json()["object"]["sha"]
+
+def create_branch(branch_name, sha):
+    url = f"https://api.github.com/repos/{REPO}/git/refs"
+    payload = {"ref": f"refs/heads/{branch_name}", "sha": sha}
+    resp = requests.post(url, headers=GH_HEADERS, json=payload)
+    if resp.status_code == 422:
+        print(f"Branch {branch_name} already exists, reusing.")
+        return
+    resp.raise_for_status()
+
+def get_file_sha(filepath, branch):
+    """Get the blob SHA of a file needed for updating it via GitHub API."""
+    url = f"https://api.github.com/repos/{REPO}/contents/{filepath}?ref={branch}"
+    resp = requests.get(url, headers=GH_HEADERS)
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()["sha"]
+
+def commit_file(filepath, content, branch, message):
+    """Create or update a file on a branch via GitHub Contents API."""
+    url = f"https://api.github.com/repos/{REPO}/contents/{filepath}"
+    file_sha = get_file_sha(filepath, branch)
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content.encode()).decode(),
+        "branch": branch,
+    }
+    if file_sha:
+        payload["sha"] = file_sha
+    resp = requests.put(url, headers=GH_HEADERS, json=payload)
+    resp.raise_for_status()
+
+def create_draft_pr(head_branch, base_branch, pr_title, pr_body):
+    url = f"https://api.github.com/repos/{REPO}/pulls"
+    payload = {
+        "title": pr_title,
+        "body": pr_body,
+        "head": head_branch,
+        "base": base_branch,
+        "draft": True
+    }
+    resp = requests.post(url, headers=GH_HEADERS, json=payload)
+    resp.raise_for_status()
+    return resp.json()["html_url"]
+
+def post_comment(body, languages_found, tool_names):
+    lang_badges = " ".join(f"`{l}`" for l in sorted(languages_found))
+    tools_used = " ".join(f"`{t}`" for t in tool_names) or "LLM only"
+    header = (
+        f"## 🤖 AI Code Review\n\n"
+        f"**Languages detected:** {lang_badges}  \n"
+        f"**Tools run:** {tools_used}\n\n---\n\n"
+    )
+    url = f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments"
+    payload = {"body": header + body}
+    resp = requests.post(url, headers=GH_HEADERS, json=payload)
+    resp.raise_for_status()
+    print(f"Review comment posted: {resp.json()['html_url']}")
 
 # ── Static analysis tools ──────────────────────────────────────────────────────
 
@@ -140,42 +227,36 @@ def run_pytest():
 
 def run_eslint(files):
     if not tool_exists("eslint"):
-        return "ESLint not installed — skipped. Add `npm install -g eslint` to workflow to enable."
+        return "ESLint not installed — skipped."
     targets = [f["filename"] for f in files if os.path.exists(f["filename"])]
-    if not targets:
-        return None
     result = subprocess.run(
         ["eslint", "--format=compact"] + targets,
         capture_output=True, text=True
     )
     out = (result.stdout + result.stderr).strip()
-    return f"ESLint (JS/TS lint):\n{out[:800]}" if out else "ESLint: no issues found."
+    return f"ESLint:\n{out[:800]}" if out else "ESLint: no issues found."
 
 def run_shellcheck(files):
     if not tool_exists("shellcheck"):
         return "ShellCheck not installed — skipped."
     targets = [f["filename"] for f in files if os.path.exists(f["filename"])]
-    if not targets:
-        return None
     result = subprocess.run(
         ["shellcheck", "--format=gcc"] + targets,
         capture_output=True, text=True
     )
     out = (result.stdout + result.stderr).strip()
-    return f"ShellCheck (shell lint):\n{out[:800]}" if out else "ShellCheck: no issues found."
+    return f"ShellCheck:\n{out[:800]}" if out else "ShellCheck: no issues found."
 
 def run_yamllint(files):
     if not tool_exists("yamllint"):
         return "yamllint not installed — skipped."
     targets = [f["filename"] for f in files if os.path.exists(f["filename"])]
-    if not targets:
-        return None
     result = subprocess.run(
         ["yamllint", "-f", "parsable"] + targets,
         capture_output=True, text=True
     )
     out = (result.stdout + result.stderr).strip()
-    return f"yamllint (YAML lint):\n{out[:600]}" if out else "yamllint: no issues found."
+    return f"yamllint:\n{out[:600]}" if out else "yamllint: no issues found."
 
 def run_json_check(files):
     results = []
@@ -189,29 +270,20 @@ def run_json_check(files):
         )
         if result.returncode != 0:
             results.append(f"- {fname}: {result.stderr.strip()}")
-    if not results:
-        return "JSON validation: all files valid."
-    return "JSON validation errors:\n" + "\n".join(results)
+    return "JSON errors:\n" + "\n".join(results) if results else "JSON: all files valid."
 
 def run_hadolint(files):
     if not tool_exists("hadolint"):
         return "Hadolint not installed — skipped."
     targets = [f["filename"] for f in files if os.path.exists(f["filename"])]
-    if not targets:
-        return None
-    result = subprocess.run(
-        ["hadolint"] + targets,
-        capture_output=True, text=True
-    )
+    result = subprocess.run(["hadolint"] + targets, capture_output=True, text=True)
     out = (result.stdout + result.stderr).strip()
-    return f"Hadolint (Dockerfile lint):\n{out[:600]}" if out else "Hadolint: no issues found."
+    return f"Hadolint:\n{out[:600]}" if out else "Hadolint: no issues found."
 
 def run_sqlfluff(files):
     if not tool_exists("sqlfluff"):
         return "sqlfluff not installed — skipped."
     targets = [f["filename"] for f in files if os.path.exists(f["filename"])]
-    if not targets:
-        return None
     result = subprocess.run(
         ["sqlfluff", "lint", "--format", "json"] + targets,
         capture_output=True, text=True
@@ -222,9 +294,7 @@ def run_sqlfluff(files):
         for file_result in data:
             for v in file_result.get("violations", []):
                 issues.append(f"- {file_result['filepath']}:{v['line_no']} [{v['code']}] {v['description']}")
-        if not issues:
-            return "sqlfluff: no SQL issues found."
-        return "sqlfluff (SQL lint):\n" + "\n".join(issues[:15])
+        return "sqlfluff:\n" + "\n".join(issues[:15]) if issues else "sqlfluff: no issues found."
     except Exception:
         return result.stdout[:500] or None
 
@@ -234,80 +304,40 @@ def run_go_vet(files):
     dirs = set(os.path.dirname(f["filename"]) or "." for f in files)
     results = []
     for d in dirs:
-        result = subprocess.run(
-            ["go", "vet", f"./{d}/..."],
-            capture_output=True, text=True
-        )
+        result = subprocess.run(["go", "vet", f"./{d}/..."], capture_output=True, text=True)
         out = (result.stdout + result.stderr).strip()
         if out:
             results.append(out)
     return "go vet:\n" + "\n".join(results)[:600] if results else "go vet: no issues found."
 
-# ── Dynamic tool runner ────────────────────────────────────────────────────────
-
 def run_tools_for_language(lang, files):
-    """Returns list of (tool_name, output) tuples for a given language."""
     results = []
-
+    dispatch = {
+        "python":     [("Ruff", run_ruff), ("Bandit", run_bandit), ("Radon", run_radon)],
+        "javascript": [("ESLint", run_eslint)],
+        "typescript": [("ESLint", run_eslint)],
+        "shell":      [("ShellCheck", run_shellcheck)],
+        "yaml":       [("yamllint", run_yamllint)],
+        "json":       [("JSON check", run_json_check)],
+        "docker":     [("Hadolint", run_hadolint)],
+        "sql":        [("sqlfluff", run_sqlfluff)],
+        "go":         [("go vet", run_go_vet)],
+    }
+    for name, fn in dispatch.get(lang, []):
+        print(f"  Running {name}...")
+        out = fn(files)
+        if out:
+            results.append((name, out))
     if lang == "python":
-        for name, fn in [("Ruff", run_ruff), ("Bandit", run_bandit), ("Radon", run_radon)]:
-            print(f"  Running {name}...")
-            out = fn(files)
-            if out:
-                results.append((name, out))
         print("  Running Pytest...")
         out = run_pytest()
         if out:
             results.append(("Pytest", out))
-
-    elif lang in ("javascript", "typescript"):
-        print("  Running ESLint...")
-        out = run_eslint(files)
-        if out:
-            results.append(("ESLint", out))
-
-    elif lang == "shell":
-        print("  Running ShellCheck...")
-        out = run_shellcheck(files)
-        if out:
-            results.append(("ShellCheck", out))
-
-    elif lang == "yaml":
-        print("  Running yamllint...")
-        out = run_yamllint(files)
-        if out:
-            results.append(("yamllint", out))
-
-    elif lang == "json":
-        print("  Running JSON validation...")
-        out = run_json_check(files)
-        if out:
-            results.append(("JSON check", out))
-
-    elif lang == "docker":
-        print("  Running Hadolint...")
-        out = run_hadolint(files)
-        if out:
-            results.append(("Hadolint", out))
-
-    elif lang == "sql":
-        print("  Running sqlfluff...")
-        out = run_sqlfluff(files)
-        if out:
-            results.append(("sqlfluff", out))
-
-    elif lang == "go":
-        print("  Running go vet...")
-        out = run_go_vet(files)
-        if out:
-            results.append(("go vet", out))
-
-    else:
-        print(f"  No static analysis tool available for '{lang}' — LLM will review diff only.")
-
+    if not dispatch.get(lang):
+        print(f"  No static analysis tool for '{lang}' — LLM will review diff only.")
     return results
 
-# ── Ollama ─────────────────────────────────────────────────────────────────────
+# ── Ollama calls ───────────────────────────────────────────────────────────────
 
 def wait_for_ollama(retries=10, delay=3):
     for i in range(retries):
@@ -322,26 +352,24 @@ def wait_for_ollama(retries=10, delay=3):
         time.sleep(delay)
     raise RuntimeError("Ollama did not start in time.")
 
-def ask_ollama(diff, tool_outputs, languages_found):
-    tools_section = ""
-    if tool_outputs:
-        tools_section = "\n\n".join(
-            f"### {name}\n{output}" for name, output in tool_outputs
-        )
-    else:
-        tools_section = "No static analysis tools ran for these file types."
+def ollama_call(prompt):
+    payload = {
+        "model": MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.1, "num_predict": 2048}
+    }
+    resp = requests.post(OLLAMA_URL, json=payload, timeout=300)
+    resp.raise_for_status()
+    return resp.json()["response"]
 
+def ask_ollama_review(diff, tool_outputs, languages_found):
+    tools_section = (
+        "\n\n".join(f"### {name}\n{output}" for name, output in tool_outputs)
+        or "No static analysis tools ran for these file types."
+    )
     lang_list = ", ".join(sorted(languages_found)) or "unknown"
-
     prompt = f"""You are an expert code reviewer. This PR contains changes in: {lang_list}.
-
-Review the diff and static analysis results below. Tailor your review to the languages present.
-
-Focus on:
-1. Security issues (hardcoded secrets, injection risks, missing auth)
-2. Performance problems (inefficient loops, blocking I/O, N+1 queries)
-3. Code quality (unclear naming, missing error handling, no documentation)
-4. Language-specific best practices for: {lang_list}
 
 ## Static Analysis Results
 {tools_section}
@@ -358,32 +386,93 @@ One paragraph overview of what this PR changes.
 For each issue: severity (🔴 High / 🟡 Medium / 🟢 Low), filename and line if known, clear explanation.
 
 ## Suggestions
-Up to 3 concrete, actionable improvement suggestions tailored to the languages in this PR.
+Up to 3 concrete, actionable improvement suggestions tailored to: {lang_list}.
 
 Be concise. If no issues found, say so clearly."""
+    return ollama_call(prompt)
 
-    payload = {
-        "model": MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": 0.2, "num_predict": 1024}
-    }
+def ask_ollama_fix(filepath, file_content, tool_outputs, language):
+    """Ask the LLM to return a fully corrected version of the file."""
+    issues_text = (
+        "\n\n".join(f"### {name}\n{output}" for name, output in tool_outputs)
+        or "No specific tool findings — use your best judgement."
+    )
+    prompt = f"""You are an expert {language} developer. Fix all issues in the file below.
 
-    resp = requests.post(OLLAMA_URL, json=payload, timeout=180)
-    resp.raise_for_status()
-    return resp.json()["response"]
+Issues found by static analysis:
+{issues_text}
 
-# ── GitHub comment ─────────────────────────────────────────────────────────────
+Rules:
+- Return ONLY the complete corrected file content, nothing else
+- Do not add any explanation, markdown fences, or commentary
+- Preserve the original logic and structure exactly
+- Only fix real issues: security risks, bugs, lint errors, and style violations
+- Do not rewrite or restructure code that has no issues
 
-def post_comment(body, languages_found, tool_names):
-    lang_badges = " ".join(f"`{l}`" for l in sorted(languages_found))
-    tools_used = " ".join(f"`{t}`" for t in tool_names) or "LLM only"
-    header = f"## 🤖 AI Code Review\n\n**Languages detected:** {lang_badges}  \n**Tools run:** {tools_used}\n\n---\n\n"
-    url = f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments"
-    payload = {"body": header + body}
-    resp = requests.post(url, headers=GH_HEADERS, json=payload)
-    resp.raise_for_status()
-    print(f"Comment posted: {resp.json()['html_url']}")
+File: {filepath}
+```
+{file_content}
+```
+
+Return the fixed file content now:"""
+    return ollama_call(prompt)
+
+# ── Auto-fix flow ──────────────────────────────────────────────────────────────
+
+def auto_fix_files(files, groups, all_tool_outputs_by_file, pr_head_branch):
+    """
+    For each changed file that has tool findings:
+    1. Fetch current content from the PR branch
+    2. Ask LLM to fix it
+    3. Commit fixed version to a new fix branch
+    Returns the fix branch name and list of fixed files.
+    """
+    fix_branch = f"ai-fixes/pr-{PR_NUMBER}"
+    head_sha = get_branch_sha(pr_head_branch)
+    create_branch(fix_branch, head_sha)
+
+    fixed_files = []
+
+    for lang, lang_files in groups.items():
+        for f in lang_files:
+            filepath = f["filename"]
+            # skip deleted files
+            if f.get("status") == "removed":
+                continue
+
+            # get per-file tool outputs (filter to findings mentioning this file)
+            relevant_tools = [
+                (name, output) for name, output in all_tool_outputs_by_file
+                if filepath in output
+            ]
+            if not relevant_tools:
+                print(f"  No findings for {filepath} — skipping auto-fix.")
+                continue
+
+            print(f"  Fetching content of {filepath}...")
+            content = get_file_content(filepath, pr_head_branch)
+            if content is None:
+                print(f"  Could not fetch {filepath} — skipping.")
+                continue
+
+            print(f"  Asking LLM to fix {filepath}...")
+            fixed_content = ask_ollama_fix(filepath, content, relevant_tools, lang)
+
+            # sanity check: don't commit if LLM returned empty or identical content
+            if not fixed_content.strip() or fixed_content.strip() == content.strip():
+                print(f"  No changes produced for {filepath} — skipping commit.")
+                continue
+
+            print(f"  Committing fix for {filepath}...")
+            commit_file(
+                filepath,
+                fixed_content,
+                fix_branch,
+                f"fix: auto-fix issues in {filepath} (AI review of PR #{PR_NUMBER})"
+            )
+            fixed_files.append(filepath)
+
+    return fix_branch, fixed_files
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
@@ -391,13 +480,19 @@ if __name__ == "__main__":
     print("Waiting for Ollama to be ready...")
     wait_for_ollama()
 
+    print("Fetching PR info...")
+    pr_info = get_pr_info()
+    pr_head_branch = pr_info["head"]["ref"]
+    pr_base_branch = pr_info["base"]["ref"]
+    print(f"  PR branch: {pr_head_branch} → {pr_base_branch}")
+
     print("Fetching PR files...")
     files = get_pr_files()
 
     print("Grouping files by language...")
     groups = group_files_by_language(files)
     languages_found = set(groups.keys())
-    print(f"  Detected languages: {', '.join(languages_found)}")
+    print(f"  Detected: {', '.join(languages_found)}")
 
     all_tool_outputs = []
     for lang, lang_files in groups.items():
@@ -408,10 +503,51 @@ if __name__ == "__main__":
     print("\nBuilding diff...")
     diff = get_diff_text(files)
 
-    print("Calling local LLM via Ollama...")
-    review = ask_ollama(diff, all_tool_outputs, languages_found)
-
+    # ── Step 1: Post review comment ──
+    print("\nGenerating review...")
+    review = ask_ollama_review(diff, all_tool_outputs, languages_found)
     tool_names = [name for name, _ in all_tool_outputs]
-    print("Posting comment to PR...")
     post_comment(review, languages_found, tool_names)
-    print("Done.")
+
+    # ── Step 2: Auto-fix and open draft PR ──
+    if all_tool_outputs:
+        print("\nAuto-fixing files with findings...")
+        fix_branch, fixed_files = auto_fix_files(
+            files, groups, all_tool_outputs, pr_head_branch
+        )
+
+        if fixed_files:
+            print(f"\nCreating draft PR from {fix_branch} → {pr_head_branch}...")
+            files_list = "\n".join(f"- `{f}`" for f in fixed_files)
+            pr_body = (
+                f"## 🤖 AI Auto-fix\n\n"
+                f"This draft PR was automatically generated by the AI code reviewer "
+                f"in response to PR #{PR_NUMBER}.\n\n"
+                f"**Files fixed:**\n{files_list}\n\n"
+                f"**Review carefully before merging** — the LLM may have made mistakes. "
+                f"Treat this as a starting point, not a final fix."
+            )
+            draft_url = create_draft_pr(
+                head_branch=fix_branch,
+                base_branch=pr_head_branch,
+                pr_title=f"fix: AI auto-fix suggestions for PR #{PR_NUMBER}",
+                pr_body=pr_body
+            )
+            # Post link to draft PR on original PR
+            url = f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments"
+            requests.post(url, headers=GH_HEADERS, json={
+                "body": (
+                    f"## 🔧 Auto-fix PR ready\n\n"
+                    f"I've applied fixes for the issues above to a draft PR for your review:\n\n"
+                    f"👉 {draft_url}\n\n"
+                    f"Files fixed: {', '.join(f'`{f}`' for f in fixed_files)}\n\n"
+                    f"_Review and merge only if the fixes look correct._"
+                )
+            })
+            print(f"Draft PR created: {draft_url}")
+        else:
+            print("No files were auto-fixed (no changes produced).")
+    else:
+        print("No tool findings — skipping auto-fix.")
+
+    print("\nDone.")
