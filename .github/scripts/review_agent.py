@@ -5,8 +5,14 @@ GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 PR_NUMBER = os.environ["PR_NUMBER"]
 REPO = os.environ["REPO"]
 
+#OLLAMA_URL = "http://localhost:11434/api/generate"
+#MODEL = "qwen2.5-coder:1.5b"
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "qwen2.5-coder:1.5b"
+
+# ── Auto-fix safety caps ───────────────────────────────────────────────────────
+MAX_FILES_TO_FIX = 10        # never auto-fix more than 10 files per PR
+MAX_LINES_TO_FIX = 500       # skip files longer than 500 lines
 
 GH_HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -38,6 +44,9 @@ SPECIAL_FILENAMES = {
     "dockerfile": "docker",
     "makefile":   "shell",
 }
+
+def count_lines(content):
+    return len(content.splitlines())
 
 def detect_language(filename):
     base = os.path.basename(filename).lower()
@@ -419,7 +428,7 @@ Return the fixed file content now:"""
 
 # ── Auto-fix flow ──────────────────────────────────────────────────────────────
 
-def auto_fix_files(files, groups, all_tool_outputs_by_file, pr_head_branch):
+'''def auto_fix_files(files, groups, all_tool_outputs_by_file, pr_head_branch):
     """
     For each changed file that has tool findings:
     1. Fetch current content from the PR branch
@@ -472,7 +481,68 @@ def auto_fix_files(files, groups, all_tool_outputs_by_file, pr_head_branch):
             )
             fixed_files.append(filepath)
 
-    return fix_branch, fixed_files
+    return fix_branch, fixed_files'''
+
+def auto_fix_files(files, groups, all_tool_outputs, pr_head_branch):
+    fix_branch = f"ai-fixes/pr-{PR_NUMBER}"
+    head_sha = get_branch_sha(pr_head_branch)
+    create_branch(fix_branch, head_sha)
+
+    fixed_files = []
+    skipped_cap = []       # files skipped because fix cap was hit
+    skipped_long = []      # files skipped because too many lines
+
+    for lang, lang_files in groups.items():
+        for f in lang_files:
+            filepath = f["filename"]
+
+            if f.get("status") == "removed":
+                continue
+
+            # ── Cap 1: max files ──────────────────────────────────────────
+            if len(fixed_files) >= MAX_FILES_TO_FIX:
+                skipped_cap.append(filepath)
+                print(f"  [{len(fixed_files)}/{MAX_FILES_TO_FIX}] File cap reached — skipping {filepath}")
+                continue
+
+            relevant_tools = [
+                (name, output) for name, output in all_tool_outputs
+                if filepath in output
+            ]
+            if not relevant_tools:
+                print(f"  No findings for {filepath} — skipping auto-fix.")
+                continue
+
+            print(f"  Fetching content of {filepath}...")
+            content = get_file_content(filepath, pr_head_branch)
+            if content is None:
+                print(f"  Could not fetch {filepath} — skipping.")
+                continue
+
+            # ── Cap 2: max lines ──────────────────────────────────────────
+            line_count = count_lines(content)
+            if line_count > MAX_LINES_TO_FIX:
+                skipped_long.append((filepath, line_count))
+                print(f"  {filepath} has {line_count} lines (limit: {MAX_LINES_TO_FIX}) — skipping.")
+                continue
+
+            print(f"  Asking LLM to fix {filepath} ({line_count} lines)...")
+            fixed_content = ask_ollama_fix(filepath, content, relevant_tools, lang)
+
+            if not fixed_content.strip() or fixed_content.strip() == content.strip():
+                print(f"  No changes produced for {filepath} — skipping commit.")
+                continue
+
+            print(f"  Committing fix for {filepath}...")
+            commit_file(
+                filepath,
+                fixed_content,
+                fix_branch,
+                f"fix: auto-fix issues in {filepath} (AI review of PR #{PR_NUMBER})"
+            )
+            fixed_files.append(filepath)
+
+    return fix_branch, fixed_files, skipped_cap, skipped_long
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
@@ -512,18 +582,33 @@ if __name__ == "__main__":
     # ── Step 2: Auto-fix and open draft PR ──
     if all_tool_outputs:
         print("\nAuto-fixing files with findings...")
-        fix_branch, fixed_files = auto_fix_files(
+        fix_branch, fixed_files, skipped_cap, skipped_long = auto_fix_files(
             files, groups, all_tool_outputs, pr_head_branch
         )
 
         if fixed_files:
             print(f"\nCreating draft PR from {fix_branch} → {pr_head_branch}...")
             files_list = "\n".join(f"- `{f}`" for f in fixed_files)
+
+            # Build skipped section for PR body
+            skipped_section = ""
+            if skipped_cap:
+                skipped_section += (
+                    f"\n\n**Skipped (file cap of {MAX_FILES_TO_FIX} reached):**\n"
+                    + "\n".join(f"- `{f}`" for f in skipped_cap)
+                )
+            if skipped_long:
+                skipped_section += (
+                    f"\n\n**Skipped (over {MAX_LINES_TO_FIX}-line limit):**\n"
+                    + "\n".join(f"- `{f}` ({n} lines)" for f, n in skipped_long)
+                )
+
             pr_body = (
                 f"## 🤖 AI Auto-fix\n\n"
                 f"This draft PR was automatically generated by the AI code reviewer "
                 f"in response to PR #{PR_NUMBER}.\n\n"
-                f"**Files fixed:**\n{files_list}\n\n"
+                f"**Files fixed ({len(fixed_files)}/{MAX_FILES_TO_FIX} cap):**\n{files_list}"
+                f"{skipped_section}\n\n"
                 f"**Review carefully before merging** — the LLM may have made mistakes. "
                 f"Treat this as a starting point, not a final fix."
             )
@@ -533,21 +618,39 @@ if __name__ == "__main__":
                 pr_title=f"fix: AI auto-fix suggestions for PR #{PR_NUMBER}",
                 pr_body=pr_body
             )
-            # Post link to draft PR on original PR
-            url = f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments"
-            requests.post(url, headers=GH_HEADERS, json={
-                "body": (
-                    f"## 🔧 Auto-fix PR ready\n\n"
-                    f"I've applied fixes for the issues above to a draft PR for your review:\n\n"
-                    f"👉 {draft_url}\n\n"
-                    f"Files fixed: {', '.join(f'`{f}`' for f in fixed_files)}\n\n"
-                    f"_Review and merge only if the fixes look correct._"
+
+            # Build comment body
+            comment_body = (
+                f"## 🔧 Auto-fix PR ready\n\n"
+                f"Applied fixes to **{len(fixed_files)} file(s)**. Draft PR for your review:\n\n"
+                f"👉 {draft_url}\n\n"
+                f"Files fixed: {', '.join(f'`{f}`' for f in fixed_files)}"
+            )
+            if skipped_cap:
+                comment_body += (
+                    f"\n\n⚠️ **{len(skipped_cap)} file(s) skipped** — hit the "
+                    f"{MAX_FILES_TO_FIX}-file cap: "
+                    + ", ".join(f"`{f}`" for f in skipped_cap)
                 )
-            })
-            print(f"Draft PR created: {draft_url}")
+            if skipped_long:
+                comment_body += (
+                    f"\n\n⚠️ **{len(skipped_long)} file(s) skipped** — over the "
+                    f"{MAX_LINES_TO_FIX}-line limit: "
+                    + ", ".join(f"`{f}` ({n} lines)" for f, n in skipped_long)
+                )
+            comment_body += "\n\n_Review and merge only if the fixes look correct._"
+
+            requests.post(
+                f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments",
+                headers=GH_HEADERS,
+                json={"body": comment_body},
+                timeout=30
+            )
+            print(f"  Draft PR created: {draft_url}")
+
         else:
-            print("No files were auto-fixed (no changes produced).")
+            print("  No files were auto-fixed (no changes produced by LLM).")
     else:
-        print("No tool findings — skipping auto-fix.")
+        print("No tool findings — skipping auto-fix step.")
 
     print("\nDone.")
