@@ -12,6 +12,15 @@ MODEL = "qwen2.5-coder:1.5b"
 MAX_FILES_TO_FIX = 10        # never auto-fix more than 10 files per PR
 MAX_LINES_TO_FIX = 500       # skip files longer than 500 lines
 
+# ── Paths the auto-fixer must never touch ─────────────────────────────────────
+EXCLUDED_PATH_PREFIXES = (
+    ".github/",          # workflow and script files — avoids self-modification
+    ".git/",             # git internals
+)
+EXCLUDED_FILENAMES = (
+    "review_agent.py",   # this script itself
+)
+
 GH_HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
     "Accept": "application/vnd.github+json",
@@ -473,6 +482,15 @@ def auto_fix_files(files, groups, all_tool_outputs, pr_head_branch):
             filepath = f["filename"]
 
             if f.get("status") == "removed":
+                continue
+
+            # ── Exclusion: never touch infra / self-referential files ──────
+            basename = os.path.basename(filepath)
+            if (
+                any(filepath.startswith(p) for p in EXCLUDED_PATH_PREFIXES)
+                or basename in EXCLUDED_FILENAMES
+            ):
+                print(f"  Excluded path — skipping auto-fix for {filepath}")
                 continue
 
             # ── Cap 1: max files ───────────────────────────────────────────
