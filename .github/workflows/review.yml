@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
-      contents: read
+      contents: write        # required for branch creation and file commits (auto-fixer)
 
     steps:
       - name: Checkout code
