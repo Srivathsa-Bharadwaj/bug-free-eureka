@@ -45,4 +45,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          # ── Optional overrides ─────────────────────────────────────────────
+          # Point at a remote Ollama instance instead of localhost:
+          # OLLAMA_HOST: ${{ secrets.OLLAMA_HOST }}
+          #
+          # Override the model (must be pulled first in the step above):
+          # OLLAMA_MODEL: "qwen2.5-coder:7b"
+          #
+          # Tune auto-fix caps:
+          # MAX_FILES_TO_FIX: "5"
+          # MAX_LINES_TO_FIX: "300"
         run: python .github/scripts/review_agent.py

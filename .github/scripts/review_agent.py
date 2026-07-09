@@ -1,31 +1,121 @@
-import os, json, requests, subprocess, time, base64
+"""
+review_agent.py — Multi-agent AI code reviewer
+Runs on GitHub Actions, uses a local Ollama LLM, posts review comments and
+opens a draft auto-fix PR. Zero API cost, zero rate limits.
+"""
+
+import os
+import re
+import sys
+import json
+import time
+import base64
+import logging
+import subprocess
+import requests
 from collections import defaultdict
 
-GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
-PR_NUMBER = os.environ["PR_NUMBER"]
-REPO = os.environ["REPO"]
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "qwen2.5-coder:1.5b"
+# ── Environment / config ───────────────────────────────────────────────────────
+
+def _require_env(name: str) -> str:
+    """Read a required environment variable; exit with a clear message if missing."""
+    val = os.environ.get(name, "").strip()
+    if not val:
+        log.error("Required environment variable '%s' is not set. Exiting.", name)
+        sys.exit(1)
+    return val
+
+def _optional_env(name: str, default: str) -> str:
+    return os.environ.get(name, "").strip() or default
+
+GITHUB_TOKEN = _require_env("GITHUB_TOKEN")
+PR_NUMBER    = _require_env("PR_NUMBER")
+REPO         = _require_env("REPO")
+
+# OLLAMA_URL and MODEL can be overridden via env vars or will fall back to defaults.
+# Set OLLAMA_HOST in your workflow env to point at a remote Ollama instance.
+OLLAMA_HOST  = _optional_env("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_URL   = f"{OLLAMA_HOST.rstrip('/')}/api/generate"
+MODEL        = _optional_env("OLLAMA_MODEL", "qwen2.5-coder:1.5b")
+
+log.info("Ollama endpoint : %s", OLLAMA_URL)
+log.info("Model           : %s", MODEL)
 
 # ── Auto-fix safety caps ───────────────────────────────────────────────────────
-MAX_FILES_TO_FIX = 10        # never auto-fix more than 10 files per PR
-MAX_LINES_TO_FIX = 500       # skip files longer than 500 lines
+MAX_FILES_TO_FIX = int(_optional_env("MAX_FILES_TO_FIX", "10"))
+MAX_LINES_TO_FIX = int(_optional_env("MAX_LINES_TO_FIX", "500"))
 
 # ── Paths the auto-fixer must never touch ─────────────────────────────────────
 EXCLUDED_PATH_PREFIXES = (
-    ".github/",          # workflow and script files — avoids self-modification
-    ".git/",             # git internals
+    ".github/",   # workflow and script files — avoids self-modification
+    ".git/",      # git internals
 )
 EXCLUDED_FILENAMES = (
-    "review_agent.py",   # this script itself
+    "review_agent.py",  # this script itself
 )
 
 GH_HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
     "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28"
+    "X-GitHub-Api-Version": "2022-11-28",
 }
+
+# ── Input validation ───────────────────────────────────────────────────────────
+
+# Only allow safe filesystem path characters — no shell metacharacters
+_SAFE_PATH_RE = re.compile(r'^[a-zA-Z0-9_\-\.\/@ ]+$')
+
+def validate_file_paths(files: list) -> list:
+    """
+    Return only paths that:
+    - exist on disk
+    - contain only safe characters (no shell metacharacters)
+    - are not absolute paths trying to escape the workspace
+    Logs a warning and drops any path that fails validation.
+    """
+    safe = []
+    for path in files:
+        if not isinstance(path, str):
+            log.warning("Skipping non-string path: %r", path)
+            continue
+        if os.path.isabs(path):
+            log.warning("Skipping absolute path (potential path traversal): %s", path)
+            continue
+        if ".." in path.split(os.sep):
+            log.warning("Skipping path with directory traversal: %s", path)
+            continue
+        if not _SAFE_PATH_RE.match(path):
+            log.warning("Skipping path with unsafe characters: %s", path)
+            continue
+        if not os.path.exists(path):
+            log.debug("Skipping non-existent path: %s", path)
+            continue
+        safe.append(path)
+    return safe
+
+def safe_subprocess(cmd: list, **kwargs) -> subprocess.CompletedProcess:
+    """
+    Run a subprocess with a validated command list.
+    - Enforces shell=False (always — never builds a shell string)
+    - Validates that the executable name contains only word characters
+    - Sets a default timeout of 60 s if not provided
+    Raises ValueError for obviously malformed commands.
+    """
+    if not cmd or not isinstance(cmd, list):
+        raise ValueError(f"Command must be a non-empty list, got: {cmd!r}")
+    executable = os.path.basename(cmd[0])
+    if not re.match(r'^[\w\-\.]+$', executable):
+        raise ValueError(f"Executable name contains unsafe characters: {executable!r}")
+    kwargs.setdefault("timeout", 60)
+    return subprocess.run(cmd, shell=False, **kwargs)  # noqa: S603
 
 # ── File type detection ────────────────────────────────────────────────────────
 
@@ -52,15 +142,15 @@ SPECIAL_FILENAMES = {
     "makefile":   "shell",
 }
 
-def detect_language(filename):
+def detect_language(filename: str) -> str:
     base = os.path.basename(filename).lower()
     if base in SPECIAL_FILENAMES:
         return SPECIAL_FILENAMES[base]
     ext = os.path.splitext(filename)[1].lower()
     return EXTENSION_MAP.get(ext, "unknown")
 
-def group_files_by_language(files):
-    groups = defaultdict(list)
+def group_files_by_language(files: list) -> dict:
+    groups: dict = defaultdict(list)
     for f in files:
         lang = detect_language(f["filename"])
         groups[lang].append(f)
@@ -68,111 +158,152 @@ def group_files_by_language(files):
 
 # ── GitHub helpers ─────────────────────────────────────────────────────────────
 
-def get_pr_info():
-    url = f"https://api.github.com/repos/{REPO}/pulls/{PR_NUMBER}"
-    resp = requests.get(url, headers=GH_HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+def _gh_get(url: str) -> dict:
+    try:
+        resp = requests.get(url, headers=GH_HEADERS, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.Timeout:
+        log.error("GitHub GET timed out: %s", url)
+        raise
+    except requests.exceptions.HTTPError as exc:
+        log.error("GitHub GET failed (%s): %s", exc.response.status_code, url)
+        raise
 
-def get_pr_files():
-    url = f"https://api.github.com/repos/{REPO}/pulls/{PR_NUMBER}/files"
-    resp = requests.get(url, headers=GH_HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+def _gh_post(url: str, payload: dict) -> dict:
+    try:
+        resp = requests.post(url, headers=GH_HEADERS, json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.Timeout:
+        log.error("GitHub POST timed out: %s", url)
+        raise
+    except requests.exceptions.HTTPError as exc:
+        log.error("GitHub POST failed (%s): %s", exc.response.status_code, url)
+        raise
 
-def get_file_content(filepath, ref):
+def _gh_put(url: str, payload: dict) -> dict:
+    try:
+        resp = requests.put(url, headers=GH_HEADERS, json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.Timeout:
+        log.error("GitHub PUT timed out: %s", url)
+        raise
+    except requests.exceptions.HTTPError as exc:
+        log.error("GitHub PUT failed (%s): %s", exc.response.status_code, url)
+        raise
+
+def get_pr_info() -> dict:
+    return _gh_get(f"https://api.github.com/repos/{REPO}/pulls/{PR_NUMBER}")
+
+def get_pr_files() -> list:
+    return _gh_get(f"https://api.github.com/repos/{REPO}/pulls/{PR_NUMBER}/files")
+
+def get_file_content(filepath: str, ref: str):
     url = f"https://api.github.com/repos/{REPO}/contents/{filepath}?ref={ref}"
-    resp = requests.get(url, headers=GH_HEADERS, timeout=30)
-    if resp.status_code == 404:
+    try:
+        resp = requests.get(url, headers=GH_HEADERS, timeout=30)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return base64.b64decode(resp.json()["content"]).decode("utf-8", errors="replace")
+    except requests.exceptions.RequestException as exc:
+        log.warning("Could not fetch %s @ %s: %s", filepath, ref, exc)
         return None
-    resp.raise_for_status()
-    return base64.b64decode(resp.json()["content"]).decode("utf-8", errors="replace")
 
-def get_diff_text(files):
+def get_diff_text(files: list) -> str:
     chunks = []
     for f in files:
         if f.get("patch"):
             lang = detect_language(f["filename"])
             chunks.append(f"File: {f['filename']} (language: {lang})\n{f['patch']}")
-    full = "\n\n---\n\n".join(chunks[:8])
-    return full[:8000]
+    return "\n\n---\n\n".join(chunks[:8])[:8000]
 
-def get_branch_sha(branch):
-    url = f"https://api.github.com/repos/{REPO}/git/ref/heads/{branch}"
-    resp = requests.get(url, headers=GH_HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.json()["object"]["sha"]
+def get_branch_sha(branch: str) -> str:
+    data = _gh_get(f"https://api.github.com/repos/{REPO}/git/ref/heads/{branch}")
+    return data["object"]["sha"]
 
-def create_branch(branch_name, sha):
+def create_branch(branch_name: str, sha: str) -> None:
     url = f"https://api.github.com/repos/{REPO}/git/refs"
-    payload = {"ref": f"refs/heads/{branch_name}", "sha": sha}
-    resp = requests.post(url, headers=GH_HEADERS, json=payload, timeout=30)
-    if resp.status_code == 422:
-        print(f"  Branch {branch_name} already exists, reusing.")
-        return
-    resp.raise_for_status()
+    try:
+        _gh_post(url, {"ref": f"refs/heads/{branch_name}", "sha": sha})
+    except requests.exceptions.HTTPError as exc:
+        if exc.response.status_code == 422:
+            log.info("Branch '%s' already exists — reusing.", branch_name)
+        else:
+            raise
 
-def get_file_sha(filepath, branch):
+def get_file_sha(filepath: str, branch: str):
     url = f"https://api.github.com/repos/{REPO}/contents/{filepath}?ref={branch}"
-    resp = requests.get(url, headers=GH_HEADERS, timeout=30)
-    if resp.status_code == 404:
+    try:
+        resp = requests.get(url, headers=GH_HEADERS, timeout=30)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()["sha"]
+    except requests.exceptions.RequestException:
         return None
-    resp.raise_for_status()
-    return resp.json()["sha"]
 
-def commit_file(filepath, content, branch, message):
+def commit_file(filepath: str, content: str, branch: str, message: str) -> None:
     url = f"https://api.github.com/repos/{REPO}/contents/{filepath}"
     file_sha = get_file_sha(filepath, branch)
-    payload = {
+    payload: dict = {
         "message": message,
         "content": base64.b64encode(content.encode()).decode(),
         "branch": branch,
     }
     if file_sha:
         payload["sha"] = file_sha
-    resp = requests.put(url, headers=GH_HEADERS, json=payload, timeout=30)
-    resp.raise_for_status()
+    _gh_put(url, payload)
 
-def create_draft_pr(head_branch, base_branch, pr_title, pr_body):
-    url = f"https://api.github.com/repos/{REPO}/pulls"
-    payload = {
-        "title": pr_title,
-        "body": pr_body,
-        "head": head_branch,
-        "base": base_branch,
-        "draft": True
-    }
-    resp = requests.post(url, headers=GH_HEADERS, json=payload, timeout=30)
-    resp.raise_for_status()
-    return resp.json()["html_url"]
+def create_draft_pr(head_branch: str, base_branch: str, pr_title: str, pr_body: str) -> str:
+    data = _gh_post(
+        f"https://api.github.com/repos/{REPO}/pulls",
+        {"title": pr_title, "body": pr_body,
+         "head": head_branch, "base": base_branch, "draft": True},
+    )
+    return data["html_url"]
 
-def post_comment(body, languages_found, tool_names):
+def post_comment(body: str, languages_found: set, tool_names: list) -> None:
     lang_badges = " ".join(f"`{l}`" for l in sorted(languages_found))
-    tools_used = " ".join(f"`{t}`" for t in tool_names) or "LLM only"
+    tools_used  = " ".join(f"`{t}`" for t in tool_names) or "LLM only"
     header = (
         f"## 🤖 AI Code Review\n\n"
         f"**Languages detected:** {lang_badges}  \n"
         f"**Tools run:** {tools_used}\n\n---\n\n"
     )
-    url = f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments"
-    resp = requests.post(url, headers=GH_HEADERS, json={"body": header + body}, timeout=30)
-    resp.raise_for_status()
-    print(f"  Review comment posted: {resp.json()['html_url']}")
+    try:
+        data = _gh_post(
+            f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments",
+            {"body": header + body},
+        )
+        log.info("Review comment posted: %s", data["html_url"])
+    except requests.exceptions.RequestException as exc:
+        log.error("Failed to post review comment: %s", exc)
+        raise
 
 # ── Static analysis tools ──────────────────────────────────────────────────────
 
-def tool_exists(name):
-    return subprocess.run(["which", name], capture_output=True).returncode == 0
+def tool_exists(name: str) -> bool:
+    try:
+        return safe_subprocess(["which", name], capture_output=True).returncode == 0
+    except (ValueError, OSError):
+        return False
 
-def run_ruff(files):
-    targets = [f["filename"] for f in files if os.path.exists(f["filename"])]
+def _safe_targets(files: list) -> list:
+    """Extract and validate filenames from the PR files list."""
+    return validate_file_paths([f["filename"] for f in files])
+
+def run_ruff(files: list):
+    targets = _safe_targets(files)
     if not targets:
         return None
-    result = subprocess.run(
-        ["ruff", "check", "--output-format=json"] + targets,
-        capture_output=True, text=True
-    )
     try:
+        result = safe_subprocess(
+            ["ruff", "check", "--output-format=json"] + targets,
+            capture_output=True, text=True,
+        )
         issues = json.loads(result.stdout)
         if not issues:
             return "Ruff: no issues found."
@@ -181,19 +312,22 @@ def run_ruff(files):
             for i in issues[:20]
         ]
         return "Ruff (Python lint):\n" + "\n".join(lines)
-    except Exception:
+    except json.JSONDecodeError:
         return result.stdout[:500] or None
+    except Exception as exc:
+        log.warning("Ruff failed: %s", exc)
+        return None
 
-def run_bandit(files):
-    targets = [f["filename"] for f in files if os.path.exists(f["filename"])]
+def run_bandit(files: list):
+    targets = _safe_targets(files)
     if not targets:
         return None
-    result = subprocess.run(
-        ["bandit", "-r", "-f", "json"] + targets,
-        capture_output=True, text=True
-    )
     try:
-        data = json.loads(result.stdout)
+        result = safe_subprocess(
+            ["bandit", "-r", "-f", "json"] + targets,
+            capture_output=True, text=True,
+        )
+        data   = json.loads(result.stdout)
         issues = data.get("results", [])
         if not issues:
             return "Bandit: no security issues found."
@@ -202,136 +336,175 @@ def run_bandit(files):
             for i in issues[:15]
         ]
         return "Bandit (Python security):\n" + "\n".join(lines)
-    except Exception:
+    except json.JSONDecodeError:
         return result.stdout[:500] or None
+    except Exception as exc:
+        log.warning("Bandit failed: %s", exc)
+        return None
 
-def run_radon(files):
-    targets = [f["filename"] for f in files if os.path.exists(f["filename"])]
+def run_radon(files: list):
+    targets = _safe_targets(files)
     if not targets:
         return None
-    result = subprocess.run(
-        ["radon", "cc", "--min", "B", "--show-complexity", "-s"] + targets,
-        capture_output=True, text=True
-    )
-    out = result.stdout.strip()
-    return f"Radon (Python complexity):\n{out[:800]}" if out else "Radon: no complex functions found."
+    try:
+        result = safe_subprocess(
+            ["radon", "cc", "--min", "B", "--show-complexity", "-s"] + targets,
+            capture_output=True, text=True,
+        )
+        out = result.stdout.strip()
+        return f"Radon (Python complexity):\n{out[:800]}" if out else "Radon: no complex functions found."
+    except Exception as exc:
+        log.warning("Radon failed: %s", exc)
+        return None
 
 def run_pytest():
     if not tool_exists("pytest"):
         return None
-    result = subprocess.run(
-        ["pytest", "--tb=short", "-q"],
-        capture_output=True, text=True
-    )
-    output = (result.stdout + result.stderr).strip()
-    return f"Pytest:\n{output[:800]}" if output else None
+    try:
+        result = safe_subprocess(
+            ["pytest", "--tb=short", "-q"],
+            capture_output=True, text=True,
+        )
+        output = (result.stdout + result.stderr).strip()
+        return f"Pytest:\n{output[:800]}" if output else None
+    except Exception as exc:
+        log.warning("Pytest failed: %s", exc)
+        return None
 
-def run_eslint(files):
+def run_eslint(files: list):
     if not tool_exists("eslint"):
         return "ESLint not installed — skipped. Add `npm install -g eslint` to workflow to enable."
-    targets = [f["filename"] for f in files if os.path.exists(f["filename"])]
+    targets = _safe_targets(files)
     if not targets:
         return None
-    result = subprocess.run(
-        ["eslint", "--format=compact"] + targets,
-        capture_output=True, text=True
-    )
-    out = (result.stdout + result.stderr).strip()
-    return f"ESLint (JS/TS lint):\n{out[:800]}" if out else "ESLint: no issues found."
+    try:
+        result = safe_subprocess(
+            ["eslint", "--format=compact"] + targets,
+            capture_output=True, text=True,
+        )
+        out = (result.stdout + result.stderr).strip()
+        return f"ESLint (JS/TS lint):\n{out[:800]}" if out else "ESLint: no issues found."
+    except Exception as exc:
+        log.warning("ESLint failed: %s", exc)
+        return None
 
-def run_shellcheck(files):
+def run_shellcheck(files: list):
     if not tool_exists("shellcheck"):
         return "ShellCheck not installed — skipped."
-    targets = [f["filename"] for f in files if os.path.exists(f["filename"])]
+    targets = _safe_targets(files)
     if not targets:
         return None
-    result = subprocess.run(
-        ["shellcheck", "--format=gcc"] + targets,
-        capture_output=True, text=True
-    )
-    out = (result.stdout + result.stderr).strip()
-    return f"ShellCheck (shell lint):\n{out[:800]}" if out else "ShellCheck: no issues found."
+    try:
+        result = safe_subprocess(
+            ["shellcheck", "--format=gcc"] + targets,
+            capture_output=True, text=True,
+        )
+        out = (result.stdout + result.stderr).strip()
+        return f"ShellCheck (shell lint):\n{out[:800]}" if out else "ShellCheck: no issues found."
+    except Exception as exc:
+        log.warning("ShellCheck failed: %s", exc)
+        return None
 
-def run_yamllint(files):
+def run_yamllint(files: list):
     if not tool_exists("yamllint"):
         return "yamllint not installed — skipped."
-    targets = [f["filename"] for f in files if os.path.exists(f["filename"])]
+    targets = _safe_targets(files)
     if not targets:
         return None
-    result = subprocess.run(
-        ["yamllint", "-f", "parsable"] + targets,
-        capture_output=True, text=True
-    )
-    out = (result.stdout + result.stderr).strip()
-    return f"yamllint (YAML lint):\n{out[:600]}" if out else "yamllint: no issues found."
-
-def run_json_check(files):
-    results = []
-    for f in files:
-        fname = f["filename"]
-        if not os.path.exists(fname):
-            continue
-        result = subprocess.run(
-            ["python3", "-m", "json.tool", fname],
-            capture_output=True, text=True
+    try:
+        result = safe_subprocess(
+            ["yamllint", "-f", "parsable"] + targets,
+            capture_output=True, text=True,
         )
-        if result.returncode != 0:
-            results.append(f"- {fname}: {result.stderr.strip()}")
-    return "JSON validation errors:\n" + "\n".join(results) if results else "JSON validation: all files valid."
+        out = (result.stdout + result.stderr).strip()
+        return f"yamllint (YAML lint):\n{out[:600]}" if out else "yamllint: no issues found."
+    except Exception as exc:
+        log.warning("yamllint failed: %s", exc)
+        return None
 
-def run_hadolint(files):
+def run_json_check(files: list):
+    results = []
+    for path in _safe_targets(files):
+        try:
+            result = safe_subprocess(
+                ["python3", "-m", "json.tool", path],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                results.append(f"- {path}: {result.stderr.strip()}")
+        except Exception as exc:
+            log.warning("JSON check failed for %s: %s", path, exc)
+    return (
+        "JSON validation errors:\n" + "\n".join(results)
+        if results else "JSON validation: all files valid."
+    )
+
+def run_hadolint(files: list):
     if not tool_exists("hadolint"):
         return "Hadolint not installed — skipped."
-    targets = [f["filename"] for f in files if os.path.exists(f["filename"])]
+    targets = _safe_targets(files)
     if not targets:
         return None
-    result = subprocess.run(
-        ["hadolint"] + targets,
-        capture_output=True, text=True
-    )
-    out = (result.stdout + result.stderr).strip()
-    return f"Hadolint (Dockerfile lint):\n{out[:600]}" if out else "Hadolint: no issues found."
+    try:
+        result = safe_subprocess(
+            ["hadolint"] + targets,
+            capture_output=True, text=True,
+        )
+        out = (result.stdout + result.stderr).strip()
+        return f"Hadolint (Dockerfile lint):\n{out[:600]}" if out else "Hadolint: no issues found."
+    except Exception as exc:
+        log.warning("Hadolint failed: %s", exc)
+        return None
 
-def run_sqlfluff(files):
+def run_sqlfluff(files: list):
     if not tool_exists("sqlfluff"):
         return "sqlfluff not installed — skipped."
-    targets = [f["filename"] for f in files if os.path.exists(f["filename"])]
+    targets = _safe_targets(files)
     if not targets:
         return None
-    result = subprocess.run(
-        ["sqlfluff", "lint", "--format", "json"] + targets,
-        capture_output=True, text=True
-    )
     try:
-        data = json.loads(result.stdout)
-        issues = []
-        for file_result in data:
-            for v in file_result.get("violations", []):
-                issues.append(
-                    f"- {file_result['filepath']}:{v['line_no']} [{v['code']}] {v['description']}"
-                )
+        result = safe_subprocess(
+            ["sqlfluff", "lint", "--format", "json"] + targets,
+            capture_output=True, text=True,
+        )
+        data   = json.loads(result.stdout)
+        issues = [
+            f"- {fr['filepath']}:{v['line_no']} [{v['code']}] {v['description']}"
+            for fr in data
+            for v in fr.get("violations", [])
+        ]
         return "sqlfluff (SQL lint):\n" + "\n".join(issues[:15]) if issues else "sqlfluff: no issues found."
-    except Exception:
+    except json.JSONDecodeError:
         return result.stdout[:500] or None
+    except Exception as exc:
+        log.warning("sqlfluff failed: %s", exc)
+        return None
 
-def run_go_vet(files):
+def run_go_vet(files: list):
     if not tool_exists("go"):
         return "Go not installed — skipped."
     dirs = set(os.path.dirname(f["filename"]) or "." for f in files)
     results = []
     for d in dirs:
-        result = subprocess.run(
-            ["go", "vet", f"./{d}/..."],
-            capture_output=True, text=True
-        )
-        out = (result.stdout + result.stderr).strip()
-        if out:
-            results.append(out)
+        # validate directory path before passing to subprocess
+        if not _SAFE_PATH_RE.match(d):
+            log.warning("Skipping unsafe Go directory: %s", d)
+            continue
+        try:
+            result = safe_subprocess(
+                ["go", "vet", f"./{d}/..."],
+                capture_output=True, text=True,
+            )
+            out = (result.stdout + result.stderr).strip()
+            if out:
+                results.append(out)
+        except Exception as exc:
+            log.warning("go vet failed for %s: %s", d, exc)
     return "go vet:\n" + "\n".join(results)[:600] if results else "go vet: no issues found."
 
 # ── Dynamic tool runner ────────────────────────────────────────────────────────
 
-def run_tools_for_language(lang, files):
+def run_tools_for_language(lang: str, files: list) -> list:
     """Returns list of (tool_name, output) tuples for a given language."""
     results = []
 
@@ -348,50 +521,69 @@ def run_tools_for_language(lang, files):
     }
 
     for name, fn in dispatch.get(lang, []):
-        print(f"  Running {name}...")
-        out = fn(files)
-        if out:
-            results.append((name, out))
+        log.info("  Running %s...", name)
+        try:
+            out = fn(files)
+            if out:
+                results.append((name, out))
+        except Exception as exc:
+            log.warning("  %s raised an unexpected error: %s", name, exc)
 
-    # Pytest is Python-only and doesn't take a files arg
     if lang == "python":
-        print("  Running Pytest...")
-        out = run_pytest()
-        if out:
-            results.append(("Pytest", out))
+        log.info("  Running Pytest...")
+        try:
+            out = run_pytest()
+            if out:
+                results.append(("Pytest", out))
+        except Exception as exc:
+            log.warning("  Pytest raised an unexpected error: %s", exc)
 
     if lang not in dispatch:
-        print(f"  No static analysis tool available for '{lang}' — LLM will review diff only.")
+        log.info("  No static analysis tool available for '%s' — LLM will review diff only.", lang)
 
     return results
 
 # ── Ollama ─────────────────────────────────────────────────────────────────────
 
-def wait_for_ollama(retries=10, delay=3):
+def wait_for_ollama(retries: int = 10, delay: int = 3) -> None:
+    health_url = f"{OLLAMA_HOST.rstrip('/')}/api/tags"
     for i in range(retries):
         try:
-            resp = requests.get("http://localhost:11434/api/tags", timeout=3)
+            resp = requests.get(health_url, timeout=3)
             if resp.status_code == 200:
-                print("Ollama is ready.")
+                log.info("Ollama is ready.")
                 return
-        except Exception:
+        except requests.exceptions.RequestException:
             pass
-        print(f"Waiting for Ollama... ({i+1}/{retries})")
+        log.info("Waiting for Ollama... (%d/%d)", i + 1, retries)
         time.sleep(delay)
-    raise RuntimeError("Ollama did not start in time.")
+    raise RuntimeError(
+        f"Ollama did not become ready after {retries * delay}s. "
+        f"Check that Ollama is running at {OLLAMA_HOST}."
+    )
 
-def ollama_call(prompt):
+def ollama_call(prompt: str) -> str:
     payload = {
         "model": MODEL,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.1, "num_predict": 2048}
+        "options": {"temperature": 0.1, "num_predict": 2048},
     }
-    resp = requests.post(OLLAMA_URL, json=payload, timeout=300)
-    resp.raise_for_status()
-    return resp.json()["response"]
+    try:
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=300)
+        resp.raise_for_status()
+        return resp.json()["response"]
+    except requests.exceptions.Timeout:
+        log.error("Ollama call timed out after 300s.")
+        raise
+    except requests.exceptions.HTTPError as exc:
+        log.error("Ollama call failed (%s): %s", exc.response.status_code, exc)
+        raise
+    except (KeyError, ValueError) as exc:
+        log.error("Unexpected Ollama response format: %s", exc)
+        raise
 
-def ask_ollama_review(diff, tool_outputs, languages_found):
+def ask_ollama_review(diff: str, tool_outputs: list, languages_found: set) -> str:
     tools_section = (
         "\n\n".join(f"### {name}\n{output}" for name, output in tool_outputs)
         or "No static analysis tools ran for these file types."
@@ -427,8 +619,7 @@ Up to 3 concrete, actionable improvement suggestions tailored to the languages i
 Be concise. If no issues found, say so clearly."""
     return ollama_call(prompt)
 
-def ask_ollama_fix(filepath, file_content, tool_outputs, language):
-    """Ask the LLM to return a fully corrected version of a file."""
+def ask_ollama_fix(filepath: str, file_content: str, tool_outputs: list, language: str) -> str:
     issues_text = (
         "\n\n".join(f"### {name}\n{output}" for name, output in tool_outputs)
         or "No specific tool findings — use your best judgement."
@@ -453,29 +644,35 @@ File: {filepath}
 Return the fixed file content now:"""
     return ollama_call(prompt)
 
-# ── Line count helper ──────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-def count_lines(content):
+def count_lines(content: str) -> int:
     return len(content.splitlines())
 
 # ── Auto-fix flow ──────────────────────────────────────────────────────────────
 
-def auto_fix_files(files, groups, all_tool_outputs, pr_head_branch):
+def auto_fix_files(files: list, groups: dict, all_tool_outputs: list, pr_head_branch: str):
     """
     For each changed file that has tool findings:
-    1. Check file and line caps before doing anything
-    2. Fetch current content from the PR branch
-    3. Ask LLM to fix it
-    4. Commit fixed version to a new fix branch
-    Returns fix branch name, fixed files, cap-skipped files, line-skipped files.
+    1. Skip excluded / removed files
+    2. Enforce file cap and line limit
+    3. Fetch current content from PR branch
+    4. Ask LLM to produce a fixed version
+    5. Commit to a new fix branch via GitHub API
+    Returns: (fix_branch, fixed_files, skipped_cap, skipped_long)
     """
     fix_branch = f"ai-fixes/pr-{PR_NUMBER}"
-    head_sha = get_branch_sha(pr_head_branch)
-    create_branch(fix_branch, head_sha)
 
-    fixed_files = []
-    skipped_cap = []      # files skipped because fix cap was hit
-    skipped_long = []     # files skipped because too many lines
+    try:
+        head_sha = get_branch_sha(pr_head_branch)
+        create_branch(fix_branch, head_sha)
+    except Exception as exc:
+        log.error("Could not create fix branch '%s': %s", fix_branch, exc)
+        raise
+
+    fixed_files  = []
+    skipped_cap  = []
+    skipped_long = []
 
     for lang, lang_files in groups.items():
         for f in lang_files:
@@ -490,163 +687,189 @@ def auto_fix_files(files, groups, all_tool_outputs, pr_head_branch):
                 any(filepath.startswith(p) for p in EXCLUDED_PATH_PREFIXES)
                 or basename in EXCLUDED_FILENAMES
             ):
-                print(f"  Excluded path — skipping auto-fix for {filepath}")
+                log.info("  Excluded path — skipping auto-fix for %s", filepath)
                 continue
 
             # ── Cap 1: max files ───────────────────────────────────────────
             if len(fixed_files) >= MAX_FILES_TO_FIX:
                 skipped_cap.append(filepath)
-                print(f"  [{len(fixed_files)}/{MAX_FILES_TO_FIX}] File cap reached — skipping {filepath}")
+                log.info(
+                    "  [%d/%d] File cap reached — skipping %s",
+                    len(fixed_files), MAX_FILES_TO_FIX, filepath,
+                )
                 continue
 
-            # Filter tool outputs to only findings that mention this file
+            # Only fix files where a tool found something
             relevant_tools = [
                 (name, output) for name, output in all_tool_outputs
                 if filepath in output
             ]
             if not relevant_tools:
-                print(f"  No findings for {filepath} — skipping auto-fix.")
+                log.info("  No findings for %s — skipping auto-fix.", filepath)
                 continue
 
-            print(f"  Fetching content of {filepath}...")
+            log.info("  Fetching content of %s...", filepath)
             content = get_file_content(filepath, pr_head_branch)
             if content is None:
-                print(f"  Could not fetch {filepath} — skipping.")
+                log.warning("  Could not fetch %s — skipping.", filepath)
                 continue
 
             # ── Cap 2: max lines ───────────────────────────────────────────
             line_count = count_lines(content)
             if line_count > MAX_LINES_TO_FIX:
                 skipped_long.append((filepath, line_count))
-                print(f"  {filepath} has {line_count} lines (limit: {MAX_LINES_TO_FIX}) — skipping.")
+                log.info(
+                    "  %s has %d lines (limit: %d) — skipping.",
+                    filepath, line_count, MAX_LINES_TO_FIX,
+                )
                 continue
 
-            print(f"  Asking LLM to fix {filepath} ({line_count} lines)...")
-            fixed_content = ask_ollama_fix(filepath, content, relevant_tools, lang)
+            log.info("  Asking LLM to fix %s (%d lines)...", filepath, line_count)
+            try:
+                fixed_content = ask_ollama_fix(filepath, content, relevant_tools, lang)
+            except Exception as exc:
+                log.warning("  LLM fix call failed for %s: %s — skipping.", filepath, exc)
+                continue
 
-            # Sanity check: don't commit if LLM returned empty or identical content
+            # Sanity check: don't commit empty or identical content
             if not fixed_content.strip() or fixed_content.strip() == content.strip():
-                print(f"  No changes produced for {filepath} — skipping commit.")
+                log.info("  No changes produced for %s — skipping commit.", filepath)
                 continue
 
-            print(f"  Committing fix for {filepath}...")
-            commit_file(
-                filepath,
-                fixed_content,
-                fix_branch,
-                f"fix: auto-fix issues in {filepath} (AI review of PR #{PR_NUMBER})"
-            )
-            fixed_files.append(filepath)
+            log.info("  Committing fix for %s...", filepath)
+            try:
+                commit_file(
+                    filepath,
+                    fixed_content,
+                    fix_branch,
+                    f"fix: auto-fix issues in {filepath} (AI review of PR #{PR_NUMBER})",
+                )
+                fixed_files.append(filepath)
+            except Exception as exc:
+                log.warning("  Could not commit fix for %s: %s — skipping.", filepath, exc)
 
     return fix_branch, fixed_files, skipped_cap, skipped_long
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Waiting for Ollama to be ready...")
-    wait_for_ollama()
+    try:
+        log.info("Waiting for Ollama to be ready...")
+        wait_for_ollama()
 
-    print("Fetching PR info...")
-    pr_info = get_pr_info()
-    pr_head_branch = pr_info["head"]["ref"]
-    pr_base_branch = pr_info["base"]["ref"]
-    print(f"  PR branch: {pr_head_branch} → {pr_base_branch}")
+        log.info("Fetching PR info...")
+        pr_info = get_pr_info()
+        pr_head_branch = pr_info["head"]["ref"]
+        pr_base_branch = pr_info["base"]["ref"]
+        log.info("PR branch: %s → %s", pr_head_branch, pr_base_branch)
 
-    print("Fetching PR files...")
-    files = get_pr_files()
+        log.info("Fetching PR files...")
+        files = get_pr_files()
+        if not files:
+            log.info("No files changed in this PR. Exiting.")
+            sys.exit(0)
 
-    print("Grouping files by language...")
-    groups = group_files_by_language(files)
-    languages_found = set(groups.keys())
-    print(f"  Detected languages: {', '.join(languages_found)}")
+        log.info("Grouping files by language...")
+        groups = group_files_by_language(files)
+        languages_found = set(groups.keys())
+        log.info("Detected languages: %s", ", ".join(languages_found))
 
-    all_tool_outputs = []
-    for lang, lang_files in groups.items():
-        print(f"\nRunning tools for: {lang} ({len(lang_files)} file(s))")
-        results = run_tools_for_language(lang, lang_files)
-        all_tool_outputs.extend(results)
+        all_tool_outputs: list = []
+        for lang, lang_files in groups.items():
+            log.info("Running tools for: %s (%d file(s))", lang, len(lang_files))
+            results = run_tools_for_language(lang, lang_files)
+            all_tool_outputs.extend(results)
 
-    print("\nBuilding diff...")
-    diff = get_diff_text(files)
+        log.info("Building diff...")
+        diff = get_diff_text(files)
 
-    # ── Step 1: Post review comment ──
-    print("\nGenerating review...")
-    review = ask_ollama_review(diff, all_tool_outputs, languages_found)
-    tool_names = [name for name, _ in all_tool_outputs]
-    post_comment(review, languages_found, tool_names)
+        # ── Step 1: Post review comment ────────────────────────────────────
+        log.info("Generating review...")
+        review = ask_ollama_review(diff, all_tool_outputs, languages_found)
+        tool_names = [name for name, _ in all_tool_outputs]
+        post_comment(review, languages_found, tool_names)
 
-    # ── Step 2: Auto-fix and open draft PR ──
-    if all_tool_outputs:
-        print("\nAuto-fixing files with findings...")
-        fix_branch, fixed_files, skipped_cap, skipped_long = auto_fix_files(
-            files, groups, all_tool_outputs, pr_head_branch
-        )
-
-        if fixed_files:
-            print(f"\nCreating draft PR from {fix_branch} → {pr_head_branch}...")
-            files_list = "\n".join(f"- `{f}`" for f in fixed_files)
-
-            # Build skipped section for draft PR body
-            skipped_section = ""
-            if skipped_cap:
-                skipped_section += (
-                    f"\n\n**Skipped (file cap of {MAX_FILES_TO_FIX} reached):**\n"
-                    + "\n".join(f"- `{f}`" for f in skipped_cap)
-                )
-            if skipped_long:
-                skipped_section += (
-                    f"\n\n**Skipped (over {MAX_LINES_TO_FIX}-line limit):**\n"
-                    + "\n".join(f"- `{f}` ({n} lines)" for f, n in skipped_long)
-                )
-
-            pr_body = (
-                f"## 🤖 AI Auto-fix\n\n"
-                f"This draft PR was automatically generated by the AI code reviewer "
-                f"in response to PR #{PR_NUMBER}.\n\n"
-                f"**Files fixed ({len(fixed_files)}/{MAX_FILES_TO_FIX} cap):**\n{files_list}"
-                f"{skipped_section}\n\n"
-                f"**Review carefully before merging** — the LLM may have made mistakes. "
-                f"Treat this as a starting point, not a final fix."
-            )
-            draft_url = create_draft_pr(
-                head_branch=fix_branch,
-                base_branch=pr_head_branch,
-                pr_title=f"fix: AI auto-fix suggestions for PR #{PR_NUMBER}",
-                pr_body=pr_body
+        # ── Step 2: Auto-fix and open draft PR ─────────────────────────────
+        if all_tool_outputs:
+            log.info("Auto-fixing files with findings...")
+            fix_branch, fixed_files, skipped_cap, skipped_long = auto_fix_files(
+                files, groups, all_tool_outputs, pr_head_branch
             )
 
-            # Build comment body for original PR
-            comment_body = (
-                f"## 🔧 Auto-fix PR ready\n\n"
-                f"Applied fixes to **{len(fixed_files)} file(s)**. Draft PR for your review:\n\n"
-                f"👉 {draft_url}\n\n"
-                f"Files fixed: {', '.join(f'`{f}`' for f in fixed_files)}"
-            )
-            if skipped_cap:
-                comment_body += (
-                    f"\n\n⚠️ **{len(skipped_cap)} file(s) skipped** — hit the "
-                    f"{MAX_FILES_TO_FIX}-file cap: "
-                    + ", ".join(f"`{f}`" for f in skipped_cap)
-                )
-            if skipped_long:
-                comment_body += (
-                    f"\n\n⚠️ **{len(skipped_long)} file(s) skipped** — over the "
-                    f"{MAX_LINES_TO_FIX}-line limit: "
-                    + ", ".join(f"`{f}` ({n} lines)" for f, n in skipped_long)
-                )
-            comment_body += "\n\n_Review and merge only if the fixes look correct._"
+            if fixed_files:
+                log.info("Creating draft PR from %s → %s...", fix_branch, pr_head_branch)
+                files_list = "\n".join(f"- `{f}`" for f in fixed_files)
 
-            requests.post(
-                f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments",
-                headers=GH_HEADERS,
-                json={"body": comment_body},
-                timeout=30
-            )
-            print(f"  Draft PR created: {draft_url}")
+                skipped_section = ""
+                if skipped_cap:
+                    skipped_section += (
+                        f"\n\n**Skipped (file cap of {MAX_FILES_TO_FIX} reached):**\n"
+                        + "\n".join(f"- `{f}`" for f in skipped_cap)
+                    )
+                if skipped_long:
+                    skipped_section += (
+                        f"\n\n**Skipped (over {MAX_LINES_TO_FIX}-line limit):**\n"
+                        + "\n".join(f"- `{f}` ({n} lines)" for f, n in skipped_long)
+                    )
 
+                pr_body = (
+                    f"## 🤖 AI Auto-fix\n\n"
+                    f"This draft PR was automatically generated by the AI code reviewer "
+                    f"in response to PR #{PR_NUMBER}.\n\n"
+                    f"**Files fixed ({len(fixed_files)}/{MAX_FILES_TO_FIX} cap):**\n{files_list}"
+                    f"{skipped_section}\n\n"
+                    f"**Review carefully before merging** — the LLM may have made mistakes. "
+                    f"Treat this as a starting point, not a final fix."
+                )
+
+                try:
+                    draft_url = create_draft_pr(
+                        head_branch=fix_branch,
+                        base_branch=pr_head_branch,
+                        pr_title=f"fix: AI auto-fix suggestions for PR #{PR_NUMBER}",
+                        pr_body=pr_body,
+                    )
+
+                    comment_body = (
+                        f"## 🔧 Auto-fix PR ready\n\n"
+                        f"Applied fixes to **{len(fixed_files)} file(s)**. "
+                        f"Draft PR for your review:\n\n"
+                        f"👉 {draft_url}\n\n"
+                        f"Files fixed: {', '.join(f'`{f}`' for f in fixed_files)}"
+                    )
+                    if skipped_cap:
+                        comment_body += (
+                            f"\n\n⚠️ **{len(skipped_cap)} file(s) skipped** — hit the "
+                            f"{MAX_FILES_TO_FIX}-file cap: "
+                            + ", ".join(f"`{f}`" for f in skipped_cap)
+                        )
+                    if skipped_long:
+                        comment_body += (
+                            f"\n\n⚠️ **{len(skipped_long)} file(s) skipped** — over the "
+                            f"{MAX_LINES_TO_FIX}-line limit: "
+                            + ", ".join(f"`{f}` ({n} lines)" for f, n in skipped_long)
+                        )
+                    comment_body += "\n\n_Review and merge only if the fixes look correct._"
+
+                    _gh_post(
+                        f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments",
+                        {"body": comment_body},
+                    )
+                    log.info("Draft PR created: %s", draft_url)
+
+                except Exception as exc:
+                    log.error("Failed to create draft PR or post fix comment: %s", exc)
+                    # Non-fatal — review comment was already posted successfully
+            else:
+                log.info("No files were auto-fixed (no changes produced by LLM).")
         else:
-            print("  No files were auto-fixed (no changes produced by LLM).")
-    else:
-        print("No tool findings — skipping auto-fix step.")
+            log.info("No tool findings — skipping auto-fix step.")
 
-    print("\nDone.")
+        log.info("Done.")
+
+    except KeyboardInterrupt:
+        log.info("Interrupted by user.")
+        sys.exit(1)
+    except Exception as exc:
+        log.exception("Unhandled exception — review agent failed: %s", exc)
+        sys.exit(1)
