@@ -142,6 +142,14 @@ SPECIAL_FILENAMES = {
     "makefile":   "shell",
 }
 
+def is_excluded_from_review(filepath: str) -> bool:
+    """Return True for files that should never be shown to the LLM reviewer."""
+    basename = os.path.basename(filepath)
+    return (
+        any(filepath.startswith(p) for p in EXCLUDED_PATH_PREFIXES)
+        or basename in EXCLUDED_FILENAMES
+    )
+
 def detect_language(filename: str) -> str:
     base = os.path.basename(filename).lower()
     if base in SPECIAL_FILENAMES:
@@ -152,6 +160,10 @@ def detect_language(filename: str) -> str:
 def group_files_by_language(files: list) -> dict:
     groups: dict = defaultdict(list)
     for f in files:
+        # skip infra/self-referential files from tool runs AND review diff
+        if is_excluded_from_review(f["filename"]):
+            log.info("Skipping excluded file from all analysis: %s", f["filename"])
+            continue
         lang = detect_language(f["filename"])
         groups[lang].append(f)
     return dict(groups)
@@ -215,9 +227,11 @@ def get_file_content(filepath: str, ref: str):
 def get_diff_text(files: list) -> str:
     chunks = []
     for f in files:
-        if f.get("patch"):
+        if f.get("patch") and not is_excluded_from_review(f["filename"]):
             lang = detect_language(f["filename"])
             chunks.append(f"File: {f['filename']} (language: {lang})\n{f['patch']}")
+    if not chunks:
+        return "(no reviewable files in this PR)"
     return "\n\n---\n\n".join(chunks[:8])[:8000]
 
 def get_branch_sha(branch: str) -> str:
@@ -591,18 +605,31 @@ def ask_ollama_review(diff: str, tool_outputs: list, languages_found: set) -> st
     lang_list = ", ".join(sorted(languages_found)) or "unknown"
     prompt = f"""You are an expert code reviewer. This PR contains changes in: {lang_list}.
 
-Review the diff and static analysis results below. Tailor your review to the languages present.
+Review ONLY the application code in the diff below. Do NOT review CI scripts, workflow files,
+or any file under .github/. Those are infrastructure files maintained separately.
 
-Focus on:
-1. Security issues (hardcoded secrets, injection risks, missing auth)
-2. Performance problems (inefficient loops, blocking I/O, N+1 queries)
-3. Code quality (unclear naming, missing error handling, no documentation)
-4. Language-specific best practices for: {lang_list}
+STRICT RULES — you must follow all of these:
+- Only report issues that are clearly visible in the diff. Do NOT invent issues.
+- Do NOT report issues that are already handled in the code (e.g. do not flag shell=False
+  if it is already present, do not flag missing error handling if try/except is present,
+  do not flag missing timeouts if timeout= is already set).
+- Do NOT flag single-letter loop variables (i, f, l, k, v) as naming issues — these are
+  standard Python idioms in list comprehensions and loops.
+- Do NOT flag hardcoded limits or constants as security issues — they are configuration.
+- A finding must be a REAL defect, not a style preference. If you are not certain it is a
+  real issue, omit it.
+- If the static analysis tools report no issues, say so and do not invent alternatives.
 
-## Static Analysis Results
+Focus only on:
+1. Security issues — actual hardcoded secrets, real injection risks, missing auth checks
+2. Performance — provably inefficient code visible in the diff
+3. Real bugs — logic errors, unhandled edge cases, incorrect error handling
+4. Missing functionality — e.g. a function that does nothing yet
+
+## Static Analysis Results (ground truth — trust these over your own analysis)
 {tools_section}
 
-## PR Diff
+## PR Diff (application code only)
 {diff}
 
 Respond using this exact format:
@@ -611,12 +638,11 @@ Respond using this exact format:
 One paragraph overview of what this PR changes.
 
 ## Issues found
-For each issue: severity (🔴 High / 🟡 Medium / 🟢 Low), filename and line if known, clear explanation.
+For each REAL issue only: severity (🔴 High / 🟡 Medium / 🟢 Low), filename and line, clear explanation.
+If no real issues found, write: "No issues found."
 
 ## Suggestions
-Up to 3 concrete, actionable improvement suggestions tailored to the languages in this PR.
-
-Be concise. If no issues found, say so clearly."""
+Up to 3 concrete suggestions — only if genuinely useful, not already addressed in the code."""
     return ollama_call(prompt)
 
 def ask_ollama_fix(filepath: str, file_content: str, tool_outputs: list, language: str) -> str:
