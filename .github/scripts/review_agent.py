@@ -52,6 +52,7 @@ log.info("Model           : %s", MODEL)
 # ── Auto-fix safety caps ───────────────────────────────────────────────────────
 MAX_FILES_TO_FIX = int(_optional_env("MAX_FILES_TO_FIX", "10"))
 MAX_LINES_TO_FIX = int(_optional_env("MAX_LINES_TO_FIX", "500"))
+MAX_FINDINGS_PER_REVIEW = int(_optional_env("MAX_FINDINGS_PER_REVIEW", "5"))  # cap LLM findings per PR
 
 # ── Paths the auto-fixer must never touch ─────────────────────────────────────
 EXCLUDED_PATH_PREFIXES = (
@@ -142,6 +143,14 @@ SPECIAL_FILENAMES = {
     "makefile":   "shell",
 }
 
+def is_excluded_from_review(filepath: str) -> bool:
+    """Return True for files that should never be shown to the LLM reviewer."""
+    basename = os.path.basename(filepath)
+    return (
+        any(filepath.startswith(p) for p in EXCLUDED_PATH_PREFIXES)
+        or basename in EXCLUDED_FILENAMES
+    )
+
 def detect_language(filename: str) -> str:
     base = os.path.basename(filename).lower()
     if base in SPECIAL_FILENAMES:
@@ -152,6 +161,10 @@ def detect_language(filename: str) -> str:
 def group_files_by_language(files: list) -> dict:
     groups: dict = defaultdict(list)
     for f in files:
+        # skip infra/self-referential files from tool runs AND review diff
+        if is_excluded_from_review(f["filename"]):
+            log.info("Skipping excluded file from all analysis: %s", f["filename"])
+            continue
         lang = detect_language(f["filename"])
         groups[lang].append(f)
     return dict(groups)
@@ -215,9 +228,11 @@ def get_file_content(filepath: str, ref: str):
 def get_diff_text(files: list) -> str:
     chunks = []
     for f in files:
-        if f.get("patch"):
+        if f.get("patch") and not is_excluded_from_review(f["filename"]):
             lang = detect_language(f["filename"])
             chunks.append(f"File: {f['filename']} (language: {lang})\n{f['patch']}")
+    if not chunks:
+        return "(no reviewable files in this PR)"
     return "\n\n---\n\n".join(chunks[:8])[:8000]
 
 def get_branch_sha(branch: str) -> str:
@@ -583,6 +598,80 @@ def ollama_call(prompt: str) -> str:
         log.error("Unexpected Ollama response format: %s", exc)
         raise
 
+def deduplicate_findings(review_text: str) -> str:
+    """
+    Post-process the LLM review output to remove duplicate findings.
+    Detects repeated (filename, issue_type) pairs and keeps only the first occurrence,
+    replacing the rest with a summary line.
+    Also hard-caps total findings at MAX_FINDINGS_PER_REVIEW.
+    """
+    lines = review_text.split("\n")
+    seen_signatures: set = set()
+    output_lines = []
+    in_issues_section = False
+    finding_count = 0
+    current_finding_lines: list = []
+    current_sig: str = ""
+
+    def flush_finding():
+        nonlocal finding_count
+        if not current_finding_lines:
+            return
+        if current_sig in seen_signatures:
+            return  # drop duplicate silently
+        if finding_count >= MAX_FINDINGS_PER_REVIEW:
+            return  # drop once cap is hit
+        seen_signatures.add(current_sig)
+        output_lines.extend(current_finding_lines)
+        finding_count += 1
+
+    for line in lines:
+        if line.strip().startswith("## Issues found"):
+            in_issues_section = True
+            output_lines.append(line)
+            continue
+        if line.strip().startswith("## ") and in_issues_section:
+            flush_finding()
+            current_finding_lines = []
+            current_sig = ""
+            in_issues_section = False
+            output_lines.append(line)
+            continue
+
+        if in_issues_section:
+            # Detect start of a new finding by severity emoji
+            if any(line.strip().startswith(s) for s in ("🔴", "🟡", "🟢", "Severity")):
+                flush_finding()
+                current_finding_lines = [line]
+                # Build a signature from filename + first 6 words of the line
+                words = line.split()
+                current_sig = " ".join(words[:6]).lower()
+            elif current_finding_lines:
+                current_finding_lines.append(line)
+                # Refine signature once we see the Filename line
+                if "filename" in line.lower() or "app.py" in line.lower():
+                    fname = line.strip().split(":")[-1].strip()
+                    current_sig = fname + "|" + current_sig
+                # Refine further once we see the Explanation line
+                if "explanation" in line.lower():
+                    words = line.lower().split()[:8]
+                    current_sig += "|" + " ".join(words)
+            else:
+                output_lines.append(line)
+        else:
+            output_lines.append(line)
+
+    flush_finding()  # flush last finding
+
+    if finding_count >= MAX_FINDINGS_PER_REVIEW:
+        output_lines.append(
+            f"\n> ⚠️ Output capped at {MAX_FINDINGS_PER_REVIEW} findings. "
+            f"Run static analysis tools directly for the full list."
+        )
+
+    return "\n".join(output_lines)
+
+
 def ask_ollama_review(diff: str, tool_outputs: list, languages_found: set) -> str:
     tools_section = (
         "\n\n".join(f"### {name}\n{output}" for name, output in tool_outputs)
@@ -591,18 +680,32 @@ def ask_ollama_review(diff: str, tool_outputs: list, languages_found: set) -> st
     lang_list = ", ".join(sorted(languages_found)) or "unknown"
     prompt = f"""You are an expert code reviewer. This PR contains changes in: {lang_list}.
 
-Review the diff and static analysis results below. Tailor your review to the languages present.
+Review ONLY the application code in the diff below. Do NOT review CI scripts, workflow files,
+or any file under .github/. Those are infrastructure files maintained separately.
 
-Focus on:
-1. Security issues (hardcoded secrets, injection risks, missing auth)
-2. Performance problems (inefficient loops, blocking I/O, N+1 queries)
-3. Code quality (unclear naming, missing error handling, no documentation)
-4. Language-specific best practices for: {lang_list}
+STRICT RULES — you must follow all of these:
+- Report a MAXIMUM of 5 issues total. Choose only the most important ones.
+- If the same issue type appears in multiple functions, report it ONCE with a note that
+  it affects multiple locations. Do NOT repeat the same finding for every line.
+- Only report issues clearly visible in the diff. Do NOT invent issues.
+- Do NOT report issues already handled in the code (shell=False present, try/except
+  present, timeout= set, etc.).
+- Do NOT flag single-letter loop variables (i, f, l, k, v) — standard Python idioms.
+- Do NOT flag hardcoded limits or constants as security issues — they are configuration.
+- Every finding MUST include a direct quote of the problematic line from the diff.
+  If you cannot quote the exact line, do not report the issue.
+- If static analysis tools report no issues, write "No issues found." and stop.
 
-## Static Analysis Results
+Focus only on:
+1. Actual hardcoded secrets or real injection risks
+2. Provably inefficient code visible in the diff
+3. Real bugs — logic errors, unhandled edge cases
+4. Missing functionality — functions that do nothing yet
+
+## Static Analysis Results (ground truth — trust these over your own analysis)
 {tools_section}
 
-## PR Diff
+## PR Diff (application code only — max 5 issues, no duplicates)
 {diff}
 
 Respond using this exact format:
@@ -611,13 +714,15 @@ Respond using this exact format:
 One paragraph overview of what this PR changes.
 
 ## Issues found
-For each issue: severity (🔴 High / 🟡 Medium / 🟢 Low), filename and line if known, clear explanation.
+Maximum 5 issues. If the same problem appears in multiple places, report it ONCE.
+For each issue: severity (🔴 High / 🟡 Medium / 🟢 Low), filename:line, quoted problematic
+line, clear explanation.
+If no real issues: write "No issues found."
 
 ## Suggestions
-Up to 3 concrete, actionable improvement suggestions tailored to the languages in this PR.
-
-Be concise. If no issues found, say so clearly."""
-    return ollama_call(prompt)
+Up to 3 suggestions — only if genuinely useful and not already in the code."""
+    raw = ollama_call(prompt)
+    return deduplicate_findings(raw)
 
 def ask_ollama_fix(filepath: str, file_content: str, tool_outputs: list, language: str) -> str:
     issues_text = (
