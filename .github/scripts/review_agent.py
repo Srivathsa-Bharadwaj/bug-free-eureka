@@ -756,7 +756,7 @@ def count_lines(content: str) -> int:
 
 # ── Auto-fix flow ──────────────────────────────────────────────────────────────
 
-def auto_fix_files(files: list, groups: dict, all_tool_outputs: list, pr_head_branch: str):
+def auto_fix_files(files: list, groups: dict, all_tool_outputs: list, pr_head_branch: str, llm_review: str = ""):
     """
     For each changed file that has tool findings:
     1. Skip excluded / removed files
@@ -804,14 +804,27 @@ def auto_fix_files(files: list, groups: dict, all_tool_outputs: list, pr_head_br
                 )
                 continue
 
-            # Only fix files where a tool found something
+            # Check static tool findings for this file
             relevant_tools = [
                 (name, output) for name, output in all_tool_outputs
                 if filepath in output
             ]
-            if not relevant_tools:
-                log.info("  No findings for %s — skipping auto-fix.", filepath)
+
+            # Also check if the LLM review mentioned this file — use it as a
+            # fallback source of findings when static tools had nothing to say
+            basename_only = os.path.basename(filepath)
+            llm_mentions_file = (
+                filepath in llm_review or basename_only in llm_review
+            )
+
+            if not relevant_tools and not llm_mentions_file:
+                log.info("  No findings for %s in tools or LLM review — skipping.", filepath)
                 continue
+
+            # If only the LLM mentioned it, use the review text as the findings context
+            if not relevant_tools and llm_mentions_file:
+                log.info("  No static tool findings for %s — using LLM review findings.", filepath)
+                relevant_tools = [("LLM Review", llm_review)]
 
             log.info("  Fetching content of %s...", filepath)
             content = get_file_content(filepath, pr_head_branch)
@@ -898,7 +911,7 @@ if __name__ == "__main__":
         if all_tool_outputs:
             log.info("Auto-fixing files with findings...")
             fix_branch, fixed_files, skipped_cap, skipped_long = auto_fix_files(
-                files, groups, all_tool_outputs, pr_head_branch
+                files, groups, all_tool_outputs, pr_head_branch, llm_review=review
             )
 
             if fixed_files:
