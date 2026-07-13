@@ -34,11 +34,20 @@ jobs:
       - name: Install Ollama
         run: curl -fsSL https://ollama.com/install.sh | sh
 
-      - name: Pull model and start Ollama
+      - name: Start Ollama server
         run: |
           ollama serve &
-          sleep 5
+          # Wait for the server to be accepting connections before pulling the model
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:11434/api/tags > /dev/null && echo "Ollama up" && break
+            echo "Waiting for Ollama ($i/15)..."
+            sleep 3
+          done
+
+      - name: Pull model
+        run: |
           ollama pull qwen2.5-coder:1.5b
+          echo "Model pull complete"
 
       - name: Run AI review
         env:
