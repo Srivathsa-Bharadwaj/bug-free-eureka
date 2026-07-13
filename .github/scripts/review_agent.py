@@ -233,7 +233,7 @@ def get_diff_text(files: list) -> str:
             chunks.append(f"File: {f['filename']} (language: {lang})\n{f['patch']}")
     if not chunks:
         return "(no reviewable files in this PR)"
-    return "\n\n---\n\n".join(chunks[:8])[:8000]
+    return "\n\n---\n\n".join(chunks[:5])[:5000]  # tighter cap — keeps prompt within context window
 
 def get_branch_sha(branch: str) -> str:
     data = _gh_get(f"https://api.github.com/repos/{REPO}/git/ref/heads/{branch}")
@@ -560,13 +560,19 @@ def run_tools_for_language(lang: str, files: list) -> list:
 
 # ── Ollama ─────────────────────────────────────────────────────────────────────
 
-def wait_for_ollama(retries: int = 10, delay: int = 3) -> None:
+def wait_for_ollama(retries: int = 20, delay: int = 5) -> None:
+    """
+    Poll until Ollama's health endpoint responds, then do a warm-up call
+    to ensure the model is loaded into memory before the real review call.
+    A 500 on the first real call usually means the model isn't loaded yet.
+    """
     health_url = f"{OLLAMA_HOST.rstrip('/')}/api/tags"
     for i in range(retries):
         try:
-            resp = requests.get(health_url, timeout=3)
+            resp = requests.get(health_url, timeout=5)
             if resp.status_code == 200:
-                log.info("Ollama is ready.")
+                log.info("Ollama server is up — warming up model %s...", MODEL)
+                _warm_up_model()
                 return
         except requests.exceptions.RequestException:
             pass
@@ -577,26 +583,90 @@ def wait_for_ollama(retries: int = 10, delay: int = 3) -> None:
         f"Check that Ollama is running at {OLLAMA_HOST}."
     )
 
+def _warm_up_model() -> None:
+    """
+    Send a minimal prompt to force the model to load into memory.
+    Retries up to 3 times on 500 errors (model still loading).
+    """
+    payload = {
+        "model": MODEL,
+        "prompt": "Say OK.",
+        "stream": False,
+        "options": {"num_predict": 5, "temperature": 0.0},
+    }
+    for attempt in range(3):
+        try:
+            resp = requests.post(OLLAMA_URL, json=payload, timeout=120)
+            if resp.status_code == 200:
+                log.info("Model warm-up complete.")
+                return
+            log.warning(
+                "Warm-up attempt %d/%d got status %d — retrying in 10s...",
+                attempt + 1, 3, resp.status_code,
+            )
+        except requests.exceptions.RequestException as exc:
+            log.warning("Warm-up attempt %d/%d failed: %s — retrying in 10s...", attempt + 1, 3, exc)
+        time.sleep(10)
+    log.warning("Model warm-up did not succeed — proceeding anyway.")
+
+# Context window budget — qwen2.5-coder:1.5b supports ~4096 tokens.
+# At ~4 chars/token, 10000 chars is a safe prompt ceiling.
+MAX_PROMPT_CHARS = int(_optional_env("MAX_PROMPT_CHARS", "10000"))
+
+def _truncate_prompt(prompt: str) -> str:
+    """Hard-truncate prompt to stay within the model context window."""
+    if len(prompt) <= MAX_PROMPT_CHARS:
+        return prompt
+    log.warning(
+        "Prompt is %d chars — truncating to %d to avoid context overflow.",
+        len(prompt), MAX_PROMPT_CHARS,
+    )
+    # Keep the instructions at the top and truncate the diff/file content in the middle
+    half = MAX_PROMPT_CHARS // 2
+    return prompt[:half] + "\n\n[... truncated to fit context window ...]\n\n" + prompt[-half:]
+
 def ollama_call(prompt: str) -> str:
+    """
+    Call Ollama with automatic retry on 500 (model still loading / OOM transient).
+    Truncates prompt if it exceeds the safe context window budget.
+    """
+    prompt = _truncate_prompt(prompt)
     payload = {
         "model": MODEL,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.1, "num_predict": 2048},
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 1024,    # reduced from 2048 — enough for review output,
+                                    # lower memory pressure on the 7GB Actions runner
+            "num_ctx": 4096,        # explicit context window — prevents 500 on overflow
+        },
     }
-    try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=300)
-        resp.raise_for_status()
-        return resp.json()["response"]
-    except requests.exceptions.Timeout:
-        log.error("Ollama call timed out after 300s.")
-        raise
-    except requests.exceptions.HTTPError as exc:
-        log.error("Ollama call failed (%s): %s", exc.response.status_code, exc)
-        raise
-    except (KeyError, ValueError) as exc:
-        log.error("Unexpected Ollama response format: %s", exc)
-        raise
+    last_exc = None
+    for attempt in range(3):
+        try:
+            resp = requests.post(OLLAMA_URL, json=payload, timeout=300)
+            if resp.status_code == 500:
+                # Transient 500 — model may still be loading or hit a memory spike
+                log.warning(
+                    "Ollama returned 500 on attempt %d/3 — retrying in 15s...", attempt + 1
+                )
+                time.sleep(15)
+                continue
+            resp.raise_for_status()
+            return resp.json()["response"]
+        except requests.exceptions.Timeout:
+            log.error("Ollama call timed out after 300s on attempt %d/3.", attempt + 1)
+            last_exc = RuntimeError("Ollama timeout")
+            time.sleep(10)
+        except requests.exceptions.HTTPError as exc:
+            log.error("Ollama call failed (%s) on attempt %d/3.", exc.response.status_code, attempt + 1)
+            last_exc = exc
+            break  # non-500 HTTP errors are not retryable
+        except (KeyError, ValueError) as exc:
+            log.error("Unexpected Ollama response format: %s", exc)
+            raise
+    raise last_exc or RuntimeError("Ollama call failed after 3 attempts.")
 
 def deduplicate_findings(review_text: str) -> str:
     """
