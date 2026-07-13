@@ -799,24 +799,29 @@ def ask_ollama_fix(filepath: str, file_content: str, tool_outputs: list, languag
         "\n\n".join(f"### {name}\n{output}" for name, output in tool_outputs)
         or "No specific tool findings — use your best judgement."
     )
-    prompt = f"""You are an expert {language} developer. Fix all issues in the file below.
+    prompt = f"""You are an expert {language} developer. Your job is to fix real code defects.
 
-Issues found by static analysis:
+Issues found in this file:
 {issues_text}
 
-Rules:
-- Return ONLY the complete corrected file content, nothing else
-- Do not add any explanation, markdown fences, or commentary
-- Preserve the original logic and structure exactly
-- Only fix real issues: security risks, bugs, lint errors, and style violations
-- Do not rewrite or restructure code that has no issues
+STRICT RULES:
+- Return ONLY the complete corrected file content. Nothing else.
+- Do NOT change comments, docstrings, or variable names unless they are the bug.
+- Do NOT change ❌ or ✅ markers in comments — leave all comments exactly as-is.
+- Fix ONLY the actual executable code that has a defect. Examples of real fixes:
+    * Add try/except around network calls that have no error handling
+    * Add timeout= to requests.request() calls that are missing it
+    * Add isinstance() validation before using a parameter as a specific type
+    * Hash passwords before including them in a request payload
+    * Add pagination parameters to API calls that fetch all records at once
+- Do NOT add markdown fences, explanations, or any text before or after the code.
+- Do NOT rewrite functions that have no defect.
+- If a function already has try/except, do not add another one.
 
-File: {filepath}
-```
+File to fix: {filepath}
 {file_content}
-```
 
-Return the fixed file content now:"""
+Return the complete fixed file now, starting from the first line of the file:"""
     return ollama_call(prompt)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
