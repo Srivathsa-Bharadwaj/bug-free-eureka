@@ -899,10 +899,21 @@ def auto_fix_files(files: list, groups: dict, all_tool_outputs: list, pr_head_br
     For each changed file that has tool findings:
     1. Skip excluded / removed / oversized files
     2. Ask LLM to produce a fixed version
-    3. Commit fixes DIRECTLY to the PR branch (no separate branch, no draft PR needed)
-       — this avoids the 403 that occurs when GITHUB_TOKEN tries to open PRs.
-    Returns: (fixed_files, skipped_cap, skipped_long)
+    3. Commit fixes to a SEPARATE branch (ai-fixes/pr-N), never the PR branch itself.
+       Uses the GitHub Contents API directly (create branch + commit file) —
+       does NOT open a pull request, so it needs no extra PR-creation permission
+       and cannot hit the 403 that /pulls requires.
+    Returns: (fix_branch, fixed_files, skipped_cap, skipped_long)
     """
+    fix_branch = f"ai-fixes/pr-{PR_NUMBER}"
+
+    try:
+        head_sha = get_branch_sha(pr_head_branch)
+        create_branch(fix_branch, head_sha)
+    except Exception as exc:
+        log.error("Could not create fix branch '%s': %s", fix_branch, exc)
+        raise
+
     fixed_files  = []
     skipped_cap  = []
     skipped_long = []
@@ -978,21 +989,20 @@ def auto_fix_files(files: list, groups: dict, all_tool_outputs: list, pr_head_br
                 log.info("  Fix output failed validation for %s — skipping commit.", filepath)
                 continue
 
-            # Commit directly to the PR branch — no separate branch needed,
-            # no draft PR needed, no extra permissions needed.
-            log.info("  Committing fix directly to PR branch for %s...", filepath)
+            # Commit to the separate fix branch — never the PR branch itself
+            log.info("  Committing fix to branch '%s' for %s...", fix_branch, filepath)
             try:
                 commit_file(
                     filepath,
                     fixed_content,
-                    pr_head_branch,
+                    fix_branch,
                     f"fix(ai-review): auto-fix issues in {filepath} [PR #{PR_NUMBER}]",
                 )
                 fixed_files.append(filepath)
             except Exception as exc:
                 log.warning("  Could not commit fix for %s: %s — skipping.", filepath, exc)
 
-    return fixed_files, skipped_cap, skipped_long
+    return fix_branch, fixed_files, skipped_cap, skipped_long
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
@@ -1033,23 +1043,29 @@ if __name__ == "__main__":
         tool_names = [name for name, _ in all_tool_outputs]
         post_comment(review, languages_found, tool_names)
 
-        # ── Step 2: Auto-fix — commits fixes directly to the PR branch ──────
+        # ── Step 2: Auto-fix — commits fixes to a separate branch ───────────
         if all_tool_outputs:
             log.info("Auto-fixing files with findings...")
-            fixed_files, skipped_cap, skipped_long = auto_fix_files(
+            fix_branch, fixed_files, skipped_cap, skipped_long = auto_fix_files(
                 files, groups, all_tool_outputs, pr_head_branch, llm_review=review
             )
 
             if fixed_files:
                 files_list = ", ".join(f"`{f}`" for f in fixed_files)
+                compare_url = (
+                    f"https://github.com/{REPO}/compare/{pr_head_branch}...{fix_branch}"
+                )
 
                 comment_body = (
-                    f"## 🔧 Auto-fix applied\n\n"
-                    f"Fixed **{len(fixed_files)} file(s)** and committed directly "
-                    f"to this PR branch for your review:\n\n"
+                    f"## 🔧 Auto-fix branch ready\n\n"
+                    f"Fixed **{len(fixed_files)} file(s)** and committed to a separate "
+                    f"branch — your PR branch was NOT touched:\n\n"
+                    f"👉 **Branch:** `{fix_branch}`\n"
+                    f"👉 **Compare:** {compare_url}\n\n"
                     f"{chr(10).join(f'- `{f}`' for f in fixed_files)}\n\n"
-                    f"Check the latest commits on this PR — the AI fixes are there. "
-                    f"Review each change carefully before merging."
+                    f"Review the diff at the link above. If it looks good, open a PR "
+                    f"from `{fix_branch}` into `{pr_head_branch}` (or cherry-pick the "
+                    f"commits) to bring the fixes into this PR."
                 )
                 if skipped_cap:
                     comment_body += (
