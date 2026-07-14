@@ -829,27 +829,80 @@ Return the complete fixed file now, starting from the first line of the file:"""
 def count_lines(content: str) -> int:
     return len(content.splitlines())
 
+# ── Fix output validation ──────────────────────────────────────────────────────
+
+# Patterns that indicate the LLM returned garbage / placeholder text instead of
+# real code — object notation, template variables, meta-commentary, etc.
+SUSPICIOUS_OUTPUT_PATTERNS = (
+    r"^\s*obj\[",                    # obj['fixed_file_content'] style hallucination
+    r"^\s*\{\{.*\}\}\s*$",             # {{ template }} placeholders
+    r"^\s*<.*>\s*$",                  # <placeholder> tags
+    r"^\s*\.\.\.\s*$",                # bare ellipsis as the entire file
+    r"^(here'?s|sure,?|certainly|i've fixed)",  # conversational preamble instead of code
+    r"^```",                          # markdown fence leaked into output
+)
+_SUSPICIOUS_RE = re.compile("|".join(SUSPICIOUS_OUTPUT_PATTERNS), re.IGNORECASE | re.MULTILINE)
+
+def is_valid_fix(fixed_content: str, original_content: str, language: str, filepath: str) -> bool:
+    """
+    Reject LLM fix output that is empty, identical, implausibly short, contains
+    hallucinated placeholder text, or fails to parse as valid syntax (Python only).
+    Returns True only if the fix looks like genuine, usable code.
+    """
+    stripped = fixed_content.strip()
+
+    if not stripped:
+        log.warning("  Rejected fix for %s: empty output.", filepath)
+        return False
+
+    if stripped == original_content.strip():
+        log.info("  No changes produced for %s.", filepath)
+        return False
+
+    # Reject if drastically shorter than the original — a real fix adds or
+    # adjusts code, it rarely shrinks a file to a fraction of its size
+    if len(stripped) < len(original_content.strip()) * 0.5:
+        log.warning(
+            "  Rejected fix for %s: output is %d chars vs original %d chars (too short).",
+            filepath, len(stripped), len(original_content.strip()),
+        )
+        return False
+
+    # Reject known hallucination / placeholder patterns
+    match = _SUSPICIOUS_RE.search(stripped)
+    if match:
+        log.warning(
+            "  Rejected fix for %s: output matches suspicious pattern %r near: %s",
+            filepath, match.group(0), stripped[:80],
+        )
+        return False
+
+    # For Python files, the output must be syntactically valid — this is the
+    # strongest guard available and catches almost all hallucinated garbage
+    if language == "python":
+        try:
+            import ast as _ast
+            _ast.parse(stripped)
+        except SyntaxError as exc:
+            log.warning(
+                "  Rejected fix for %s: output is not valid Python (%s).",
+                filepath, exc,
+            )
+            return False
+
+    return True
+
 # ── Auto-fix flow ──────────────────────────────────────────────────────────────
 
 def auto_fix_files(files: list, groups: dict, all_tool_outputs: list, pr_head_branch: str, llm_review: str = ""):
     """
     For each changed file that has tool findings:
-    1. Skip excluded / removed files
-    2. Enforce file cap and line limit
-    3. Fetch current content from PR branch
-    4. Ask LLM to produce a fixed version
-    5. Commit to a new fix branch via GitHub API
-    Returns: (fix_branch, fixed_files, skipped_cap, skipped_long)
+    1. Skip excluded / removed / oversized files
+    2. Ask LLM to produce a fixed version
+    3. Commit fixes DIRECTLY to the PR branch (no separate branch, no draft PR needed)
+       — this avoids the 403 that occurs when GITHUB_TOKEN tries to open PRs.
+    Returns: (fixed_files, skipped_cap, skipped_long)
     """
-    fix_branch = f"ai-fixes/pr-{PR_NUMBER}"
-
-    try:
-        head_sha = get_branch_sha(pr_head_branch)
-        create_branch(fix_branch, head_sha)
-    except Exception as exc:
-        log.error("Could not create fix branch '%s': %s", fix_branch, exc)
-        raise
-
     fixed_files  = []
     skipped_cap  = []
     skipped_long = []
@@ -885,30 +938,26 @@ def auto_fix_files(files: list, groups: dict, all_tool_outputs: list, pr_head_br
                 if filepath in output
             ]
 
-            # Also check if the LLM review mentioned this file — use it as a
-            # fallback source of findings when static tools had nothing to say
+            # Fallback: use LLM review text if static tools had nothing for this file
             basename_only = os.path.basename(filepath)
-            llm_mentions_file = (
-                filepath in llm_review or basename_only in llm_review
-            )
+            llm_mentions_file = filepath in llm_review or basename_only in llm_review
 
             if not relevant_tools and not llm_mentions_file:
                 log.info("  No findings for %s in tools or LLM review — skipping.", filepath)
                 continue
 
-            # If only the LLM mentioned it, use the review text as the findings context
             if not relevant_tools and llm_mentions_file:
                 log.info("  No static tool findings for %s — using LLM review findings.", filepath)
                 relevant_tools = [("LLM Review", llm_review)]
 
             log.info("  Fetching content of %s...", filepath)
-            content = get_file_content(filepath, pr_head_branch)
-            if content is None:
+            file_content = get_file_content(filepath, pr_head_branch)
+            if file_content is None:
                 log.warning("  Could not fetch %s — skipping.", filepath)
                 continue
 
             # ── Cap 2: max lines ───────────────────────────────────────────
-            line_count = count_lines(content)
+            line_count = count_lines(file_content)
             if line_count > MAX_LINES_TO_FIX:
                 skipped_long.append((filepath, line_count))
                 log.info(
@@ -919,29 +968,31 @@ def auto_fix_files(files: list, groups: dict, all_tool_outputs: list, pr_head_br
 
             log.info("  Asking LLM to fix %s (%d lines)...", filepath, line_count)
             try:
-                fixed_content = ask_ollama_fix(filepath, content, relevant_tools, lang)
+                fixed_content = ask_ollama_fix(filepath, file_content, relevant_tools, lang)
             except Exception as exc:
                 log.warning("  LLM fix call failed for %s: %s — skipping.", filepath, exc)
                 continue
 
-            # Sanity check: don't commit empty or identical content
-            if not fixed_content.strip() or fixed_content.strip() == content.strip():
-                log.info("  No changes produced for %s — skipping commit.", filepath)
+            # Sanity check: reject empty, identical, or implausible output
+            if not is_valid_fix(fixed_content, file_content, lang, filepath):
+                log.info("  Fix output failed validation for %s — skipping commit.", filepath)
                 continue
 
-            log.info("  Committing fix for %s...", filepath)
+            # Commit directly to the PR branch — no separate branch needed,
+            # no draft PR needed, no extra permissions needed.
+            log.info("  Committing fix directly to PR branch for %s...", filepath)
             try:
                 commit_file(
                     filepath,
                     fixed_content,
-                    fix_branch,
-                    f"fix: auto-fix issues in {filepath} (AI review of PR #{PR_NUMBER})",
+                    pr_head_branch,
+                    f"fix(ai-review): auto-fix issues in {filepath} [PR #{PR_NUMBER}]",
                 )
                 fixed_files.append(filepath)
             except Exception as exc:
                 log.warning("  Could not commit fix for %s: %s — skipping.", filepath, exc)
 
-    return fix_branch, fixed_files, skipped_cap, skipped_long
+    return fixed_files, skipped_cap, skipped_long
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
@@ -982,77 +1033,46 @@ if __name__ == "__main__":
         tool_names = [name for name, _ in all_tool_outputs]
         post_comment(review, languages_found, tool_names)
 
-        # ── Step 2: Auto-fix and open draft PR ─────────────────────────────
+        # ── Step 2: Auto-fix — commits fixes directly to the PR branch ──────
         if all_tool_outputs:
             log.info("Auto-fixing files with findings...")
-            fix_branch, fixed_files, skipped_cap, skipped_long = auto_fix_files(
+            fixed_files, skipped_cap, skipped_long = auto_fix_files(
                 files, groups, all_tool_outputs, pr_head_branch, llm_review=review
             )
 
             if fixed_files:
-                log.info("Creating draft PR from %s → %s...", fix_branch, pr_head_branch)
-                files_list = "\n".join(f"- `{f}`" for f in fixed_files)
+                files_list = ", ".join(f"`{f}`" for f in fixed_files)
 
-                skipped_section = ""
+                comment_body = (
+                    f"## 🔧 Auto-fix applied\n\n"
+                    f"Fixed **{len(fixed_files)} file(s)** and committed directly "
+                    f"to this PR branch for your review:\n\n"
+                    f"{chr(10).join(f'- `{f}`' for f in fixed_files)}\n\n"
+                    f"Check the latest commits on this PR — the AI fixes are there. "
+                    f"Review each change carefully before merging."
+                )
                 if skipped_cap:
-                    skipped_section += (
-                        f"\n\n**Skipped (file cap of {MAX_FILES_TO_FIX} reached):**\n"
-                        + "\n".join(f"- `{f}`" for f in skipped_cap)
+                    comment_body += (
+                        f"\n\n⚠️ **{len(skipped_cap)} file(s) skipped** — hit the "
+                        f"{MAX_FILES_TO_FIX}-file cap: "
+                        + ", ".join(f"`{f}`" for f in skipped_cap)
                     )
                 if skipped_long:
-                    skipped_section += (
-                        f"\n\n**Skipped (over {MAX_LINES_TO_FIX}-line limit):**\n"
-                        + "\n".join(f"- `{f}` ({n} lines)" for f, n in skipped_long)
+                    comment_body += (
+                        f"\n\n⚠️ **{len(skipped_long)} file(s) skipped** — over "
+                        f"the {MAX_LINES_TO_FIX}-line limit: "
+                        + ", ".join(f"`{f}` ({n} lines)" for f, n in skipped_long)
                     )
-
-                pr_body = (
-                    f"## 🤖 AI Auto-fix\n\n"
-                    f"This draft PR was automatically generated by the AI code reviewer "
-                    f"in response to PR #{PR_NUMBER}.\n\n"
-                    f"**Files fixed ({len(fixed_files)}/{MAX_FILES_TO_FIX} cap):**\n{files_list}"
-                    f"{skipped_section}\n\n"
-                    f"**Review carefully before merging** — the LLM may have made mistakes. "
-                    f"Treat this as a starting point, not a final fix."
-                )
+                comment_body += "\n\n_Treat AI fixes as a starting point — verify before merging._"
 
                 try:
-                    draft_url = create_draft_pr(
-                        head_branch=fix_branch,
-                        base_branch=pr_head_branch,
-                        pr_title=f"fix: AI auto-fix suggestions for PR #{PR_NUMBER}",
-                        pr_body=pr_body,
-                    )
-
-                    comment_body = (
-                        f"## 🔧 Auto-fix PR ready\n\n"
-                        f"Applied fixes to **{len(fixed_files)} file(s)**. "
-                        f"Draft PR for your review:\n\n"
-                        f"👉 {draft_url}\n\n"
-                        f"Files fixed: {', '.join(f'`{f}`' for f in fixed_files)}"
-                    )
-                    if skipped_cap:
-                        comment_body += (
-                            f"\n\n⚠️ **{len(skipped_cap)} file(s) skipped** — hit the "
-                            f"{MAX_FILES_TO_FIX}-file cap: "
-                            + ", ".join(f"`{f}`" for f in skipped_cap)
-                        )
-                    if skipped_long:
-                        comment_body += (
-                            f"\n\n⚠️ **{len(skipped_long)} file(s) skipped** — over the "
-                            f"{MAX_LINES_TO_FIX}-line limit: "
-                            + ", ".join(f"`{f}` ({n} lines)" for f, n in skipped_long)
-                        )
-                    comment_body += "\n\n_Review and merge only if the fixes look correct._"
-
                     _gh_post(
                         f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments",
                         {"body": comment_body},
                     )
-                    log.info("Draft PR created: %s", draft_url)
-
+                    log.info("Auto-fix comment posted. Files fixed: %s", ", ".join(fixed_files))
                 except Exception as exc:
-                    log.error("Failed to create draft PR or post fix comment: %s", exc)
-                    # Non-fatal — review comment was already posted successfully
+                    log.error("Failed to post auto-fix comment: %s", exc)
             else:
                 log.info("No files were auto-fixed (no changes produced by LLM).")
         else:
